@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import re
 from pathlib import Path
 import zipfile
 from datetime import datetime
@@ -38,6 +39,15 @@ def get_site_config(url: str):
         if domain in url_lower:
             return cfg
     return CONFIG.get("default", {})
+
+
+def extract_resume_url(text: str) -> str | None:
+    """Шукає посилання для продовження скачування"""
+    # Шукаємо будь-яке http/https посилання в логах
+    urls = re.findall(r'https?://[^\s<>"\']+', text)
+    if urls:
+        return urls[-1]  # беремо останнє (найімовірніше — для resume)
+    return None
 
 
 async def monitor_folder(folder: Path, message: types.Message, sent_files: set):
@@ -173,8 +183,8 @@ async def process_mode(callback: types.CallbackQuery):
     cmd.append(url)
 
     process = await asyncio.create_subprocess_exec(
-        *cmd, 
-        stdout=asyncio.subprocess.PIPE, 
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE
     )
 
@@ -182,18 +192,29 @@ async def process_mode(callback: types.CallbackQuery):
         sent_files = set()
         monitor_task = asyncio.create_task(monitor_folder(download_dir, callback.message, sent_files))
 
-    try:
-        await asyncio.wait_for(process.communicate(), timeout=1800)
-    except asyncio.TimeoutError:
-        if process:
-            process.kill()
-        await callback.message.answer("⏰ Скачування тривало надто довго.")
-        return
-    finally:
-        if mode == "slow":
-            monitor_task.cancel()
+    stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=1800)
 
-    # Після завершення
+    if mode == "slow":
+        monitor_task.cancel()
+
+    # === НОВА ЛОГІКА ОБРОБКИ ПОМИЛОК ===
+    error_text = (stderr or b"").decode('utf-8', errors='ignore') + (stdout or b"").decode('utf-8', errors='ignore')
+
+    resume_url = extract_resume_url(error_text)
+
+    if process.returncode != 0 or resume_url:
+        await callback.message.answer(
+            f"⚠️ Скачування перервано або неповне.\n"
+            f"Збережено те, що встигло."
+        )
+        if resume_url:
+            await callback.message.answer(
+                f"🔄 Можна продовжити з цього посилання:\n"
+                f"<code>{resume_url}</code>\n\n"
+                f"Просто надішли його мені ще раз."
+            )
+
+    # Завжди створюємо архів з тим, що є
     await create_and_send_zip(download_dir, callback.message, url)
 
     if mode == "fast":
@@ -204,7 +225,8 @@ async def process_mode(callback: types.CallbackQuery):
 async def cmd_start(message: types.Message):
     await message.answer(
         "👋 <b>PixGrabber Bot</b>\n\n"
-        "Надішли посилання — я запитаю режим скачування."
+        "Надішли посилання — я запитаю режим скачування.\n"
+        "Тепер при помилках показую лінк для продовження."
     )
 
 
