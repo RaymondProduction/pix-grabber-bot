@@ -41,7 +41,7 @@ def get_site_config(url: str):
 
 
 async def monitor_folder(folder: Path, message: types.Message, sent_files: set):
-    """Виправлений моніторинг — правильно відкриває файли"""
+    """Моніторинг для режиму 'По одному'"""
     while True:
         await asyncio.sleep(2)
 
@@ -58,12 +58,11 @@ async def monitor_folder(folder: Path, message: types.Message, sent_files: set):
                 key = str(file_path)
                 if key not in sent_files and file_path.exists():
                     try:
-                        # Відкриваємо файл заново кожен раз!
-                        with open(file_path, 'rb') as f:
-                            await message.answer_photo(
-                                types.BufferedInputFile(f.read(), filename=file_path.name),
-                                caption=f"📸 {file_path.name}"
-                            )
+                        data = file_path.read_bytes()
+                        await message.answer_photo(
+                            types.BufferedInputFile(data, filename=file_path.name),
+                            caption=f"📸 {file_path.name}"
+                        )
                         sent_files.add(key)
                         logging.info(f"Відправлено: {file_path.name}")
                     except Exception as e:
@@ -73,12 +72,12 @@ async def monitor_folder(folder: Path, message: types.Message, sent_files: set):
 
 
 async def send_all_images_at_once(folder: Path, message: types.Message):
-    """Відправляє всі зображення одразу"""
+    """Відправляє всі картинки одразу"""
     images = sorted(
         [f for f in folder.rglob("*") if f.is_file() and f.suffix.lower() in {'.jpg','.jpeg','.png','.gif','.webp','.bmp'}],
         key=lambda x: x.stat().st_mtime
     )
-    
+
     if not images:
         await message.answer("Не знайдено зображень.")
         return
@@ -87,35 +86,41 @@ async def send_all_images_at_once(folder: Path, message: types.Message):
 
     for img in images:
         try:
-            with open(img, 'rb') as f:
-                await message.answer_photo(
-                    types.BufferedInputFile(f.read(), filename=img.name),
-                    caption=img.name
-                )
+            data = img.read_bytes()
+            await message.answer_photo(
+                types.BufferedInputFile(data, filename=img.name),
+                caption=img.name
+            )
             await asyncio.sleep(0.5)
         except Exception as e:
             logging.error(f"Не вдалося відправити {img.name}: {e}")
 
 
 async def create_and_send_zip(folder: Path, message: types.Message, url: str):
-    """Створює і відправляє ZIP"""
+    """Виправлена функція створення та відправки ZIP"""
     images = [f for f in folder.rglob("*") if f.is_file() and f.suffix.lower() in {'.jpg','.jpeg','.png','.gif','.webp','.bmp'}]
     
     if not images:
+        await message.answer("Не знайдено зображень для архіву.")
         return
 
     zip_path = folder / "gallery.zip"
+
+    # Створюємо архів
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
         for img in images:
             zf.write(img, img.name)
 
+    # Відправляємо архів правильно
     try:
-        with open(zip_path, "rb") as f:
-            await message.answer_document(
-                f,
-                caption=f"📦 Готово!\nЗображень: {len(images)}\n🔗 {url}"
-            )
+        data = zip_path.read_bytes()
+        await message.answer_document(
+            types.BufferedInputFile(data, filename="gallery.zip"),
+            caption=f"📦 Готово!\nЗображень: {len(images)}\n🔗 {url}"
+        )
+        logging.info(f"Архів відправлено: {len(images)} файлів")
     except Exception as e:
+        logging.error(f"Помилка відправки ZIP: {e}")
         await message.answer(f"Не вдалося відправити архів: {e}")
 
 
@@ -188,6 +193,7 @@ async def process_mode(callback: types.CallbackQuery):
         if mode == "slow":
             monitor_task.cancel()
 
+    # Після завершення
     await create_and_send_zip(download_dir, callback.message, url)
 
     if mode == "fast":
