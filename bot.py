@@ -107,32 +107,51 @@ async def send_all_images_at_once(folder: Path, message: types.Message):
 
 
 async def create_and_send_zip(folder: Path, message: types.Message, url: str):
-    """Виправлена функція створення та відправки ZIP"""
-    images = [f for f in folder.rglob("*") if f.is_file() and f.suffix.lower() in {'.jpg','.jpeg','.png','.gif','.webp','.bmp'}]
+    """Виправлена функція створення та відправки ZIP з осмисленою назвою"""
+    # Знаходимо всі зображення
+    images = [f for f in folder.rglob("*.*") 
+              if f.is_file() and f.suffix.lower() in {'.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp'}]
     
     if not images:
         await message.answer("Не знайдено зображень для архіву.")
         return
 
-    zip_path = folder / "gallery.zip"
+    # Шукаємо назву галереї — йдемо на глибину 2 рівні
+    gallery_folder = None
+    for p in folder.rglob("*"):
+        if p.is_dir() and any(img.suffix.lower() in {'.jpg','.jpeg','.png','.gif','.webp','.bmp'} for img in p.iterdir()):
+            gallery_folder = p
+            break
+
+    if gallery_folder:
+        gallery_name = gallery_folder.name
+        # Очищаємо назву від неприпустимих символів
+        safe_name = re.sub(r'[\\/*?:"<>|]', '_', gallery_name)[:120]
+        zip_filename = f"{safe_name}.zip"
+    else:
+        zip_filename = "gallery.zip"
+
+    zip_path = folder / zip_filename
 
     # Створюємо архів
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
         for img in images:
             zf.write(img, img.name)
 
-    # Відправляємо архів правильно
+    # Відправляємо архів
     try:
         data = zip_path.read_bytes()
         await message.answer_document(
-            types.BufferedInputFile(data, filename="gallery.zip"),
-            caption=f"📦 Готово!\nЗображень: {len(images)}\n🔗 {url}"
+            types.BufferedInputFile(data, filename=zip_filename),
+            caption=f"📦 Готово!\n"
+                    f"Зображень: {len(images)}\n"
+                    f"Назва: {gallery_name if gallery_folder else 'gallery'}\n"
+                    f"🔗 {url}"
         )
-        logging.info(f"Архів відправлено: {len(images)} файлів")
+        logging.info(f"Архів відправлено: {zip_filename} ({len(images)} файлів)")
     except Exception as e:
         logging.error(f"Помилка відправки ZIP: {e}")
         await message.answer(f"Не вдалося відправити архів: {e}")
-
 
 async def handle_url(message: types.Message, url: str):
     cfg = get_site_config(url)
