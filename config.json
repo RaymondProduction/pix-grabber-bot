@@ -1,0 +1,21 @@
+{
+  "telegram_token": "TOKEN",
+  "sites": {
+    "pixiv.net": {
+      "username": "YOUR_PIXIV_USERNAME",
+      "password": "YOUR_PIXIV_PASSWORD"
+    },
+    "twitter.com": {
+      "username": "YOUR_TWITTER_USERNAME",
+      "password": "YOUR_TWITTER_PASSWORD_OR_TOKEN"
+    },
+    "x.com": {
+      "username": "YOUR_X_USERNAME",
+      "password": "YOUR_X_PASSWORD_OR_TOKEN"
+    },
+    "fanbox.cc": {
+      "username": "YOUR_FANBOX_USERNAME",
+      "password": "YOUR_FANBOX_PASSWORD"
+    }
+  }
+}
