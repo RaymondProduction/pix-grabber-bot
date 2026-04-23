@@ -28,6 +28,8 @@ BASE_DOWNLOAD_DIR.mkdir(exist_ok=True)
 
 HISTORY_FILE = Path("history.json")
 PENDING_PARTIAL_REQUESTS = {}
+download_queue: asyncio.Queue = asyncio.Queue()
+queue_worker_started = False
 
 
 def load_history() -> list:
@@ -90,7 +92,7 @@ def extract_resume_url(text: str) -> Optional[str]:
 
 async def send_start_menu(message: types.Message):
     await message.answer(
-        "👏🏽 <b>PixGrabber Bot</b>\n\n"
+        "👋 <b>PixGrabber Bot</b>\n\n"
         "Надішли посилання — для завантаження.",
         reply_markup=build_main_menu()
     )
@@ -378,6 +380,18 @@ async def run_download(message: types.Message, url: str, history_index: int, dow
     await create_and_send_zip(download_dir, message, history_index)
 
 
+async def queue_worker():
+    while True:
+        message, url, history_index, download_dir = await download_queue.get()
+        try:
+            await run_download(message, url, history_index, download_dir)
+        except Exception as e:
+            logging.error(f"Помилка в черзі для {url}: {e}")
+            await send_start_menu(message)
+        finally:
+            download_queue.task_done()
+
+
 async def handle_url(message: types.Message, url: str):
     await message.answer(f"🔄 Посилання прийнято: <b>{urlparse(url).netloc}</b>")
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -556,28 +570,40 @@ async def resume_download(callback: types.CallbackQuery):
         return
 
     await callback.answer()
-    await callback.message.answer("⏩ Продовжую скачування з того самого місця...")
+    position = download_queue.qsize()
+    if position == 0:
+        await callback.message.answer("⏩ Продовжую скачування з того самого місця...")
+    else:
+        await callback.message.answer(f"⏩ Докачку додано в чергу. Позиція: {position}")
 
     update_history_entry(index, status="in_progress")
 
-    await run_download(
-        callback.message,
-        resume_url,
-        index,
-        Path(download_dir_value)
-    )
+    await download_queue.put((callback.message, resume_url, index, Path(download_dir_value)))
+
+    if not queue_worker_started:
+        asyncio.create_task(queue_worker())
 
 
 @dp.callback_query(F.data.startswith("mode:"))
 async def process_mode(callback: types.CallbackQuery):
+    global queue_worker_started
     _, action, url = callback.data.split(":", 2)
-    await callback.message.edit_text("✅ Починаю скачування...")
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     download_dir = BASE_DOWNLOAD_DIR / f"{timestamp}_{urlparse(url).netloc}"
     history_index = add_history_entry(url, str(download_dir))
 
-    await run_download(callback.message, url, history_index, download_dir)
+    position = download_queue.qsize()
+    if position == 0:
+        await callback.message.edit_text("✅ Починаю скачування...")
+    else:
+        await callback.message.edit_text(f"✅ Додано в чергу. Позиція: {position}")
+
+    await download_queue.put((callback.message, url, history_index, download_dir))
+
+    if not queue_worker_started:
+        queue_worker_started = True
+        asyncio.create_task(queue_worker())
 
 
 @dp.callback_query(F.data.startswith("resend:"))
