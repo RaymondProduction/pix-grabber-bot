@@ -75,6 +75,13 @@ def build_main_menu() -> InlineKeyboardMarkup:
     ])
 
 
+def build_redownload_keyboard(url: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Скачати наново", callback_data=f"mode:slow:{url}")],
+        [InlineKeyboardButton(text="⬅️ До історії", callback_data="show_history")]
+    ])
+
+
 def get_image_names_from_zip(zip_path: Path) -> list[str]:
     with zipfile.ZipFile(zip_path, 'r') as zf:
         return [
@@ -286,11 +293,16 @@ async def history_item_callback(callback: types.CallbackQuery):
     entry = history[index]
     zip_path = Path(entry["zip_path"])
 
+    await callback.answer()
+
     if not zip_path.exists():
-        await callback.answer("Файл більше не існує на диску.", show_alert=True)
+        await callback.message.answer(
+            f"⚠️ Архів для <b>{entry['gallery_name']}</b> недоступний або був видалений.\n\n"
+            f"Можна спробувати скачати його наново з цього посилання:\n{entry['url']}",
+            reply_markup=build_redownload_keyboard(entry["url"])
+        )
         return
 
-    await callback.answer()
     await callback.message.answer(
         f"📁 <b>{entry['gallery_name']}</b>\n"
         f"🖼 Зображень: {entry['image_count']}\n"
@@ -313,7 +325,12 @@ async def partial_resend_request(callback: types.CallbackQuery):
     zip_path = Path(entry["zip_path"])
 
     if not zip_path.exists():
-        await callback.answer("Архів не знайдено.", show_alert=True)
+        await callback.answer()
+        await callback.message.answer(
+            f"⚠️ Архів недоступний або був видалений.\n"
+            f"Можна скачати його наново з цього посилання:",
+            reply_markup=build_redownload_keyboard(entry["url"])
+        )
         return
 
     try:
@@ -416,11 +433,16 @@ async def resend_zip(callback: types.CallbackQuery):
     entry = history[index]
     zip_path = Path(entry["zip_path"])
 
+    await callback.answer()
+
     if not zip_path.exists():
-        await callback.answer("Файл більше не існує на диску.", show_alert=True)
+        await callback.message.answer(
+            f"⚠️ Архів недоступний або був видалений.\n"
+            f"Можна скачати його наново з цього посилання:",
+            reply_markup=build_redownload_keyboard(entry["url"])
+        )
         return
 
-    await callback.answer()
     data = zip_path.read_bytes()
     await callback.message.answer_document(
         types.BufferedInputFile(data, filename=zip_path.name),
@@ -457,8 +479,18 @@ async def handle_partial_selection(message: types.Message):
 
     zip_path = Path(pending["zip_path"])
     if not zip_path.exists():
+        history = load_history()
+        history_index = pending.get("history_index")
+        entry = history[history_index] if history_index is not None and history_index < len(history) else None
         PENDING_PARTIAL_REQUESTS.pop(message.from_user.id, None)
-        await message.answer("Архів більше не знайдено.", reply_markup=build_main_menu())
+
+        if entry:
+            await message.answer(
+                "Архів більше не знайдено. Можна скачати його наново:",
+                reply_markup=build_redownload_keyboard(entry["url"])
+            )
+        else:
+            await message.answer("Архів більше не знайдено.", reply_markup=build_main_menu())
         return
 
     try:
