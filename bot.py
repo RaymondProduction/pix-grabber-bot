@@ -68,6 +68,30 @@ def extract_resume_url(text: str) -> Optional[str]:
     return None
 
 
+def build_main_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📋 Переглянути історію", callback_data="show_history")]
+    ])
+
+
+async def send_history(message: types.Message):
+    history = load_history()
+    if not history:
+        await message.answer("Історія порожня.", reply_markup=build_main_menu())
+        return
+
+    buttons = []
+    for i, entry in enumerate(reversed(history)):
+        real_index = len(history) - 1 - i
+        label = f"{'✅' if Path(entry['zip_path']).exists() else '❌'} {entry['gallery_name'][:40]} ({entry['image_count']} шт.) — {entry['date']}"
+        buttons.append([InlineKeyboardButton(text=label, callback_data=f"resend:{real_index}")])
+
+    buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_start")])
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+    await message.answer(f"📋 Історія завантажень ({len(history)} шт.):", reply_markup=keyboard)
+
+
 async def monitor_folder(folder: Path, message: types.Message, sent_files: set):
     while True:
         await asyncio.sleep(2)
@@ -99,7 +123,7 @@ async def create_and_send_zip(folder: Path, message: types.Message, url: str):
               if f.is_file() and f.suffix.lower() in {'.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp'}]
 
     if not images:
-        await message.answer("Не знайдено зображень для архіву.")
+        await message.answer("Не знайдено зображень для архіву.", reply_markup=build_main_menu())
         return
 
     gallery_folder = None
@@ -128,19 +152,37 @@ async def create_and_send_zip(folder: Path, message: types.Message, url: str):
         data = zip_path.read_bytes()
         await message.answer_document(
             types.BufferedInputFile(data, filename=zip_filename),
-            caption=f"📦 Готово!\nЗображень: {len(images)}\nНазва: {gallery_name}\n🔗 {url}"
+            caption=f"📦 Готово!\nЗображень: {len(images)}\nНазва: {gallery_name}\n🔗 {url}",
+            reply_markup=build_main_menu()
         )
     except Exception as e:
         logging.error(f"Помилка відправки ZIP: {e}")
-        await message.answer(f"Не вдалося відправити архів: {e}")
+        await message.answer(f"Не вдалося відправити архів: {e}", reply_markup=build_main_menu())
 
 
 async def handle_url(message: types.Message, url: str):
     await message.answer(f"🔄 Посилання прийнято: <b>{urlparse(url).netloc}</b>")
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📸 По одному (в процесі)", callback_data=f"mode:slow:{url}")]
+        [InlineKeyboardButton(text="📸 По одному (в процесі)", callback_data=f"mode:slow:{url}")],
+        [InlineKeyboardButton(text="📋 Історія", callback_data="show_history")]
     ])
     await message.answer("Натисни щоб почати завантаження:", reply_markup=keyboard)
+
+
+@dp.callback_query(F.data == "show_history")
+async def show_history_callback(callback: types.CallbackQuery):
+    await callback.answer()
+    await send_history(callback.message)
+
+
+@dp.callback_query(F.data == "back_to_start")
+async def back_to_start_callback(callback: types.CallbackQuery):
+    await callback.answer()
+    await callback.message.answer(
+        "👋 <b>PixGrabber Bot</b>\n\n"
+        "Надішли посилання — я запитаю режим скачування.",
+        reply_markup=build_main_menu()
+    )
 
 
 @dp.callback_query(F.data.startswith("mode:"))
@@ -220,33 +262,22 @@ async def resend_zip(callback: types.CallbackQuery):
     data = zip_path.read_bytes()
     await callback.message.answer_document(
         types.BufferedInputFile(data, filename=zip_path.name),
-        caption=f"📦 {entry['gallery_name']}\n🖼 {entry['image_count']} зображень\n📅 {entry['date']}\n🔗 {entry['url']}"
+        caption=f"📦 {entry['gallery_name']}\n🖼 {entry['image_count']} зображень\n📅 {entry['date']}\n🔗 {entry['url']}",
+        reply_markup=build_main_menu()
     )
 
 
 @dp.message(Command("history"))
 async def cmd_history(message: types.Message):
-    history = load_history()
-    if not history:
-        await message.answer("Історія порожня.")
-        return
-
-    buttons = []
-    for i, entry in enumerate(reversed(history)):
-        real_index = len(history) - 1 - i
-        label = f"{'✅' if Path(entry['zip_path']).exists() else '❌'} {entry['gallery_name'][:40]} ({entry['image_count']} шт.) — {entry['date']}"
-        buttons.append([InlineKeyboardButton(text=label, callback_data=f"resend:{real_index}")])
-
-    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
-    await message.answer(f"📋 Історія завантажень ({len(history)} шт.):", reply_markup=keyboard)
+    await send_history(message)
 
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     await message.answer(
         "👋 <b>PixGrabber Bot</b>\n\n"
-        "Надішли посилання — я запитаю режим скачування.\n"
-        "/history — список всіх завантажень."
+        "Надішли посилання — для завантаження.",
+        reply_markup=build_main_menu()
     )
 
 
