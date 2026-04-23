@@ -372,8 +372,7 @@ async def run_download(message: types.Message, url: str, history_index: int, dow
                 "🔄 Можна продовжити з цього місця.",
                 reply_markup=build_resume_keyboard(history_index)
             )
-        else:
-            await send_start_menu(message)
+        await send_start_menu(message)
         return
 
     await create_and_send_zip(download_dir, message, history_index)
