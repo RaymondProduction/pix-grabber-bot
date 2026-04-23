@@ -128,6 +128,15 @@ def parse_photo_selection(text: str, max_count: int) -> list[int]:
     return result
 
 
+def cleanup_images_after_zip(images: list[Path], zip_path: Path):
+    for img in images:
+        try:
+            if img.exists() and img != zip_path:
+                img.unlink()
+        except Exception as e:
+            logging.error(f"Не вдалося видалити файл {img}: {e}")
+
+
 async def send_selected_images(zip_path: Path, image_names: list[str], selected_indexes: list[int], message: types.Message):
     selected_names = [image_names[i] for i in selected_indexes]
 
@@ -224,6 +233,8 @@ async def create_and_send_zip(folder: Path, message: types.Message, url: str):
         for img in images:
             zf.write(img, img.name)
 
+    cleanup_images_after_zip(images, zip_path)
+
     add_to_history(url, gallery_name, str(zip_path), len(images))
 
     try:
@@ -241,7 +252,7 @@ async def create_and_send_zip(folder: Path, message: types.Message, url: str):
 async def handle_url(message: types.Message, url: str):
     await message.answer(f"🔄 Посилання прийнято: <b>{urlparse(url).netloc}</b>")
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📸 По одному (в процесі)", callback_data=f"mode:slow:{url}")],
+        [InlineKeyboardButton(text="📸 Грабуємо 👏🏽", callback_data=f"mode:slow:{url}")],
         [InlineKeyboardButton(text="📋 Історія", callback_data="show_history")]
     ])
     await message.answer("Натисни щоб почати завантаження:", reply_markup=keyboard)
