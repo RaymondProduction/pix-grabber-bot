@@ -94,27 +94,6 @@ async def monitor_folder(folder: Path, message: types.Message, sent_files: set):
             logging.error(f"Помилка в monitor_folder: {e}")
 
 
-async def send_all_images_at_once(folder: Path, message: types.Message):
-    images = sorted(
-        [f for f in folder.rglob("*") if f.is_file() and f.suffix.lower() in {'.jpg','.jpeg','.png','.gif','.webp','.bmp'}],
-        key=lambda x: x.stat().st_mtime
-    )
-    if not images:
-        await message.answer("Не знайдено зображень.")
-        return
-    await message.answer(f"📤 Відправляю {len(images)} зображень...")
-    for img in images:
-        try:
-            data = img.read_bytes()
-            await message.answer_photo(
-                types.BufferedInputFile(data, filename=img.name),
-                caption=img.name
-            )
-            await asyncio.sleep(0.5)
-        except Exception as e:
-            logging.error(f"Не вдалося відправити {img.name}: {e}")
-
-
 async def create_and_send_zip(folder: Path, message: types.Message, url: str):
     images = [f for f in folder.rglob("*.*")
               if f.is_file() and f.suffix.lower() in {'.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp'}]
@@ -159,16 +138,15 @@ async def create_and_send_zip(folder: Path, message: types.Message, url: str):
 async def handle_url(message: types.Message, url: str):
     await message.answer(f"🔄 Посилання прийнято: <b>{urlparse(url).netloc}</b>")
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📸 По одному (в процесі)", callback_data=f"mode:slow:{url}")],
-        [InlineKeyboardButton(text="⚡ Швидко (всі в кінці)", callback_data=f"mode:fast:{url}")]
+        [InlineKeyboardButton(text="📸 По одному (в процесі)", callback_data=f"mode:slow:{url}")]
     ])
-    await message.answer("Обери режим завантаження:", reply_markup=keyboard)
+    await message.answer("Натисни щоб почати завантаження:", reply_markup=keyboard)
 
 
 @dp.callback_query(F.data.startswith("mode:"))
 async def process_mode(callback: types.CallbackQuery):
     _, mode, url = callback.data.split(":", 2)
-    await callback.message.edit_text(f"✅ Обрано: {'По одному' if mode == 'slow' else 'Швидко'}\n\nПочинаю скачування...")
+    await callback.message.edit_text(f"✅ Починаю скачування...")
 
     cfg = get_site_config(url)
     username = cfg.get("username")
@@ -202,14 +180,12 @@ async def process_mode(callback: types.CallbackQuery):
         stderr=asyncio.subprocess.PIPE
     )
 
-    if mode == "slow":
-        sent_files = set()
-        monitor_task = asyncio.create_task(monitor_folder(download_dir, callback.message, sent_files))
+    sent_files = set()
+    monitor_task = asyncio.create_task(monitor_folder(download_dir, callback.message, sent_files))
 
     stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=1800)
 
-    if mode == "slow":
-        monitor_task.cancel()
+    monitor_task.cancel()
 
     error_text = (stderr or b"").decode('utf-8', errors='ignore') + (stdout or b"").decode('utf-8', errors='ignore')
     resume_url = extract_resume_url(error_text)
@@ -222,9 +198,6 @@ async def process_mode(callback: types.CallbackQuery):
             )
 
     await create_and_send_zip(download_dir, callback.message, url)
-
-    if mode == "fast":
-        await send_all_images_at_once(download_dir, callback.message)
 
 
 @dp.callback_query(F.data.startswith("resend:"))
