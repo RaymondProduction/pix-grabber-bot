@@ -88,6 +88,14 @@ def extract_resume_url(text: str) -> Optional[str]:
     return None
 
 
+async def send_start_menu(message: types.Message):
+    await message.answer(
+        "👏🏽 <b>PixGrabber Bot</b>\n\n"
+        "Надішли посилання — для завантаження.",
+        reply_markup=build_main_menu()
+    )
+
+
 def build_main_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📋 Переглянути історію", callback_data="show_history")]
@@ -299,11 +307,12 @@ async def create_and_send_zip(folder: Path, message: types.Message, history_inde
         await message.answer_document(
             types.BufferedInputFile(data, filename=zip_filename),
             caption=f"📦 Готово!\nЗображень: {len(images)}\nНазва: {gallery_name}",
-            reply_markup=build_main_menu()
         )
+        await send_start_menu(message)
     except Exception as e:
         logging.error(f"Помилка відправки ZIP: {e}")
-        await message.answer(f"Не вдалося відправити архів: {e}", reply_markup=build_main_menu())
+        await message.answer(f"Не вдалося відправити архів: {e}")
+        await send_start_menu(message)
 
 
 async def run_download(message: types.Message, url: str, history_index: int, download_dir: Path):
@@ -364,7 +373,7 @@ async def run_download(message: types.Message, url: str, history_index: int, dow
                 reply_markup=build_resume_keyboard(history_index)
             )
         else:
-            await message.answer("Повертаємось до меню.", reply_markup=build_main_menu())
+            await send_start_menu(message)
         return
 
     await create_and_send_zip(download_dir, message, history_index)
@@ -633,6 +642,7 @@ async def on_link(message: types.Message):
 async def handle_partial_selection(message: types.Message):
     pending = PENDING_PARTIAL_REQUESTS.get(message.from_user.id)
     if not pending:
+        await send_start_menu(message)
         return
 
     zip_path = Path(pending["zip_path"])
