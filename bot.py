@@ -42,15 +42,30 @@ def save_history(history: list):
         json.dump(history, f, ensure_ascii=False, indent=2)
 
 
-def add_to_history(url: str, gallery_name: str, zip_path: str, image_count: int):
+def add_history_entry(url: str, download_dir: str) -> int:
     history = load_history()
     history.append({
         "url": url,
-        "gallery_name": gallery_name,
-        "zip_path": zip_path,
-        "image_count": image_count,
-        "date": datetime.now().strftime("%Y-%m-%d %H:%M")
+        "gallery_name": "in_progress",
+        "zip_path": "",
+        "image_count": 0,
+        "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "status": "in_progress",
+        "resume_url": "",
+        "download_dir": download_dir
     })
+    save_history(history)
+    return len(history) - 1
+
+
+def update_history_entry(index: int, **kwargs):
+    history = load_history()
+    if index < 0 or index >= len(history):
+        return
+
+    for key, value in kwargs.items():
+        history[index][key] = value
+
     save_history(history)
 
 
@@ -63,6 +78,10 @@ def get_site_config(url: str):
 
 
 def extract_resume_url(text: str) -> Optional[str]:
+    match = re.search(r"Use '([^']+)' as input URL to continue downloading", text)
+    if match:
+        return match.group(1)
+
     urls = re.findall(r'https?://[^\s<>"\']+', text)
     if urls:
         return urls[-1]
@@ -77,7 +96,14 @@ def build_main_menu() -> InlineKeyboardMarkup:
 
 def build_redownload_keyboard(url: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔄 Скачати наново", callback_data=f"mode:slow:{url}")],
+        [InlineKeyboardButton(text="🔄 Скачати наново", callback_data=f"mode:new:{url}")],
+        [InlineKeyboardButton(text="⬅️ До історії", callback_data="show_history")]
+    ])
+
+
+def build_resume_keyboard(index: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⏩ Докачати", callback_data=f"resume:{index}")],
         [InlineKeyboardButton(text="⬅️ До історії", callback_data="show_history")]
     ])
 
@@ -177,7 +203,18 @@ async def send_history(message: types.Message):
     buttons = []
     for i, entry in enumerate(reversed(history)):
         real_index = len(history) - 1 - i
-        label = f"{'✅' if Path(entry['zip_path']).exists() else '❌'} {entry['gallery_name'][:40]} ({entry['image_count']} шт.) — {entry['date']}"
+        status = entry.get("status", "done")
+
+        if status == "interrupted":
+            marker = "⏸"
+        elif Path(entry.get("zip_path", "")).exists():
+            marker = "✅"
+        elif status == "in_progress":
+            marker = "🟡"
+        else:
+            marker = "❌"
+
+        label = f"{marker} {entry['gallery_name'][:40]} ({entry['image_count']} шт.) — {entry['date']}"
         buttons.append([InlineKeyboardButton(text=label, callback_data=f"history_item:{real_index}")])
 
     buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_start")])
@@ -212,7 +249,7 @@ async def monitor_folder(folder: Path, message: types.Message, sent_files: set):
             logging.error(f"Помилка в monitor_folder: {e}")
 
 
-async def create_and_send_zip(folder: Path, message: types.Message, url: str):
+async def create_and_send_zip(folder: Path, message: types.Message, history_index: int):
     images = [f for f in folder.rglob("*.*")
               if f.is_file() and f.suffix.lower() in {'.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp'}]
 
@@ -222,17 +259,21 @@ async def create_and_send_zip(folder: Path, message: types.Message, url: str):
 
     gallery_folder = None
     for p in folder.rglob("*"):
-        if p.is_dir() and any(img.suffix.lower() in {'.jpg','.jpeg','.png','.gif','.webp','.bmp'} for img in p.iterdir()):
-            gallery_folder = p
-            break
+        if p.is_dir():
+            try:
+                if any(img.is_file() and img.suffix.lower() in {'.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp'} for img in p.iterdir()):
+                    gallery_folder = p
+                    break
+            except Exception:
+                continue
 
     if gallery_folder:
         gallery_name = gallery_folder.name
         safe_name = re.sub(r'[\\/*?:"<>|]', '_', gallery_name)[:120]
         zip_filename = f"{safe_name}.zip"
     else:
-        gallery_name = "gallery"
-        zip_filename = "gallery.zip"
+        gallery_name = folder.name
+        zip_filename = f"{folder.name}.zip"
 
     zip_path = folder / zip_filename
 
@@ -242,13 +283,20 @@ async def create_and_send_zip(folder: Path, message: types.Message, url: str):
 
     cleanup_images_after_zip(images, zip_path)
 
-    add_to_history(url, gallery_name, str(zip_path), len(images))
+    update_history_entry(
+        history_index,
+        gallery_name=gallery_name,
+        zip_path=str(zip_path),
+        image_count=len(images),
+        status="done",
+        resume_url=""
+    )
 
     try:
         data = zip_path.read_bytes()
         await message.answer_document(
             types.BufferedInputFile(data, filename=zip_filename),
-            caption=f"📦 Готово!\nЗображень: {len(images)}\nНазва: {gallery_name}\n🔗 {url}",
+            caption=f"📦 Готово!\nЗображень: {len(images)}\nНазва: {gallery_name}",
             reply_markup=build_main_menu()
         )
     except Exception as e:
@@ -256,10 +304,72 @@ async def create_and_send_zip(folder: Path, message: types.Message, url: str):
         await message.answer(f"Не вдалося відправити архів: {e}", reply_markup=build_main_menu())
 
 
+async def run_download(message: types.Message, url: str, history_index: int, download_dir: Path):
+    cfg = get_site_config(url)
+    username = cfg.get("username")
+    password = cfg.get("password")
+
+    download_dir.mkdir(parents=True, exist_ok=True)
+
+    cmd = [
+        "gallery-dl",
+        "--dest", str(download_dir),
+        "--filename", "{num:0>4}.{extension}",
+        "--no-part",
+        "--no-mtime"
+    ]
+
+    if username and password:
+        cmd.extend(["--username", username, "--password", password])
+
+    if any(d in url.lower() for d in ["e-hentai.org", "exhentai.org"]):
+        cookies_path = Path("cookies.txt")
+        if cookies_path.exists():
+            cmd.extend(["--cookies", str(cookies_path.resolve())])
+
+    cmd.append(url)
+
+    process = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
+    )
+
+    sent_files = set()
+    monitor_task = asyncio.create_task(monitor_folder(download_dir, message, sent_files))
+
+    try:
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=1800)
+    finally:
+        monitor_task.cancel()
+
+    error_text = (stderr or b"").decode('utf-8', errors='ignore') + (stdout or b"").decode('utf-8', errors='ignore')
+    resume_url = extract_resume_url(error_text)
+
+    if process.returncode != 0 or resume_url:
+        update_history_entry(
+            history_index,
+            status="interrupted",
+            resume_url=resume_url or "",
+            download_dir=str(download_dir)
+        )
+
+        await message.answer("⚠️ Скачування перервано або неповне.\nЗбережено те, що встигло.")
+
+        if resume_url:
+            await message.answer(
+                "🔄 Можна продовжити з цього місця.",
+                reply_markup=build_resume_keyboard(history_index)
+            )
+        return
+
+    await create_and_send_zip(download_dir, message, history_index)
+
+
 async def handle_url(message: types.Message, url: str):
     await message.answer(f"🔄 Посилання прийнято: <b>{urlparse(url).netloc}</b>")
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📸 Грабуємо 👏🏽", callback_data=f"mode:slow:{url}")],
+        [InlineKeyboardButton(text="📸 Грабуємо 👏🏽", callback_data=f"mode:new:{url}")],
         [InlineKeyboardButton(text="📋 Історія", callback_data="show_history")]
     ])
     await message.answer("Натисни щоб почати завантаження:", reply_markup=keyboard)
@@ -291,9 +401,19 @@ async def history_item_callback(callback: types.CallbackQuery):
         return
 
     entry = history[index]
-    zip_path = Path(entry["zip_path"])
+    zip_path = Path(entry.get("zip_path", ""))
+    status = entry.get("status", "done")
 
     await callback.answer()
+
+    if status == "interrupted" and entry.get("resume_url"):
+        await callback.message.answer(
+            f"⏸ <b>{entry['gallery_name']}</b>\n"
+            f"Скачування було перерване.\n"
+            f"Можна докачати з того самого місця.",
+            reply_markup=build_resume_keyboard(index)
+        )
+        return
 
     if not zip_path.exists():
         await callback.message.answer(
@@ -322,13 +442,21 @@ async def partial_resend_request(callback: types.CallbackQuery):
         return
 
     entry = history[index]
-    zip_path = Path(entry["zip_path"])
+    zip_path = Path(entry.get("zip_path", ""))
+
+    if entry.get("status") == "interrupted" and entry.get("resume_url"):
+        await callback.answer()
+        await callback.message.answer(
+            "⚠️ Це завантаження ще не завершене. Спочатку докачай його.",
+            reply_markup=build_resume_keyboard(index)
+        )
+        return
 
     if not zip_path.exists():
         await callback.answer()
         await callback.message.answer(
-            f"⚠️ Архів недоступний або був видалений.\n"
-            f"Можна скачати його наново з цього посилання:",
+            "⚠️ Архів недоступний або був видалений.\n"
+            "Можна скачати його наново з цього посилання:",
             reply_markup=build_redownload_keyboard(entry["url"])
         )
         return
@@ -364,61 +492,46 @@ async def partial_resend_request(callback: types.CallbackQuery):
     )
 
 
+@dp.callback_query(F.data.startswith("resume:"))
+async def resume_download(callback: types.CallbackQuery):
+    index = int(callback.data.split(":", 1)[1])
+    history = load_history()
+
+    if index >= len(history):
+        await callback.answer("Запис не знайдено.", show_alert=True)
+        return
+
+    entry = history[index]
+    resume_url = entry.get("resume_url")
+    download_dir_value = entry.get("download_dir")
+
+    if not resume_url or not download_dir_value:
+        await callback.answer("Немає даних для докачки.", show_alert=True)
+        return
+
+    await callback.answer()
+    await callback.message.answer("⏩ Продовжую скачування з того самого місця...")
+
+    update_history_entry(index, status="in_progress")
+
+    await run_download(
+        callback.message,
+        resume_url,
+        index,
+        Path(download_dir_value)
+    )
+
+
 @dp.callback_query(F.data.startswith("mode:"))
 async def process_mode(callback: types.CallbackQuery):
-    _, mode, url = callback.data.split(":", 2)
-    await callback.message.edit_text(f"✅ Починаю скачування...")
-
-    cfg = get_site_config(url)
-    username = cfg.get("username")
-    password = cfg.get("password")
+    _, action, url = callback.data.split(":", 2)
+    await callback.message.edit_text("✅ Починаю скачування...")
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     download_dir = BASE_DOWNLOAD_DIR / f"{timestamp}_{urlparse(url).netloc}"
-    download_dir.mkdir(parents=True, exist_ok=True)
+    history_index = add_history_entry(url, str(download_dir))
 
-    cmd = [
-        "gallery-dl",
-        "--dest", str(download_dir),
-        "--filename", "{num:0>4}.{extension}",
-        "--no-part",
-        "--no-mtime"
-    ]
-
-    if username and password:
-        cmd.extend(["--username", username, "--password", password])
-
-    if any(d in url.lower() for d in ["e-hentai.org", "exhentai.org"]):
-        cookies_path = Path("cookies.txt")
-        if cookies_path.exists():
-            cmd.extend(["--cookies", str(cookies_path.resolve())])
-
-    cmd.append(url)
-
-    process = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE
-    )
-
-    sent_files = set()
-    monitor_task = asyncio.create_task(monitor_folder(download_dir, callback.message, sent_files))
-
-    stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=1800)
-
-    monitor_task.cancel()
-
-    error_text = (stderr or b"").decode('utf-8', errors='ignore') + (stdout or b"").decode('utf-8', errors='ignore')
-    resume_url = extract_resume_url(error_text)
-
-    if process.returncode != 0 or resume_url:
-        await callback.message.answer("⚠️ Скачування перервано або неповне.\nЗбережено те, що встигло.")
-        if resume_url:
-            await callback.message.answer(
-                f"🔄 Можна продовжити з цього посилання:\n<code>{resume_url}</code>\n\nПросто надішли його мені ще раз."
-            )
-
-    await create_and_send_zip(download_dir, callback.message, url)
+    await run_download(callback.message, url, history_index, download_dir)
 
 
 @dp.callback_query(F.data.startswith("resend:"))
@@ -431,14 +544,21 @@ async def resend_zip(callback: types.CallbackQuery):
         return
 
     entry = history[index]
-    zip_path = Path(entry["zip_path"])
+    zip_path = Path(entry.get("zip_path", ""))
 
     await callback.answer()
 
+    if entry.get("status") == "interrupted" and entry.get("resume_url"):
+        await callback.message.answer(
+            "⚠️ Це скачування ще не завершене. Можна докачати:",
+            reply_markup=build_resume_keyboard(index)
+        )
+        return
+
     if not zip_path.exists():
         await callback.message.answer(
-            f"⚠️ Архів недоступний або був видалений.\n"
-            f"Можна скачати його наново з цього посилання:",
+            "⚠️ Архів недоступний або був видалений.\n"
+            "Можна скачати його наново з цього посилання:",
             reply_markup=build_redownload_keyboard(entry["url"])
         )
         return
