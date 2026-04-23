@@ -117,10 +117,11 @@ def get_image_names_from_zip(zip_path: Path) -> list[str]:
         ]
 
 
-def build_history_actions_keyboard(index: int) -> InlineKeyboardMarkup:
+def build_history_actions_keyboard(index: int, url: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📦 Переслати архів", callback_data=f"resend:{index}")],
         [InlineKeyboardButton(text="🖼 Переслати частину фото", callback_data=f"partial:{index}")],
+        [InlineKeyboardButton(text="🔗 Отримати посилання", callback_data=f"get_url:{index}")],
         [InlineKeyboardButton(text="⬅️ До історії", callback_data="show_history")]
     ])
 
@@ -217,6 +218,7 @@ async def send_history(message: types.Message):
         label = f"{marker} {entry['gallery_name'][:40]} ({entry['image_count']} шт.) — {entry['date']}"
         buttons.append([InlineKeyboardButton(text=label, callback_data=f"history_item:{real_index}")])
 
+    buttons.append([InlineKeyboardButton(text="⬇️ Скачати JSON з історією", callback_data="export_history_json")])
     buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_start")])
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -361,6 +363,8 @@ async def run_download(message: types.Message, url: str, history_index: int, dow
                 "🔄 Можна продовжити з цього місця.",
                 reply_markup=build_resume_keyboard(history_index)
             )
+        else:
+            await message.answer("Повертаємось до меню.", reply_markup=build_main_menu())
         return
 
     await create_and_send_zip(download_dir, message, history_index)
@@ -379,6 +383,23 @@ async def handle_url(message: types.Message, url: str):
 async def show_history_callback(callback: types.CallbackQuery):
     await callback.answer()
     await send_history(callback.message)
+
+
+@dp.callback_query(F.data == "export_history_json")
+async def export_history_json(callback: types.CallbackQuery):
+    await callback.answer()
+    history = load_history()
+    if not history:
+        await callback.message.answer("Історія порожня.", reply_markup=build_main_menu())
+        return
+
+    data = json.dumps(history, ensure_ascii=False, indent=2).encode('utf-8')
+    filename = f"history_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    await callback.message.answer_document(
+        types.BufferedInputFile(data, filename=filename),
+        caption=f"📄 Історія завантажень ({len(history)} записів)",
+        reply_markup=build_main_menu()
+    )
 
 
 @dp.callback_query(F.data == "back_to_start")
@@ -428,7 +449,24 @@ async def history_item_callback(callback: types.CallbackQuery):
         f"🖼 Зображень: {entry['image_count']}\n"
         f"📅 {entry['date']}\n"
         f"🔗 {entry['url']}",
-        reply_markup=build_history_actions_keyboard(index)
+        reply_markup=build_history_actions_keyboard(index, entry["url"])
+    )
+
+
+@dp.callback_query(F.data.startswith("get_url:"))
+async def get_url_callback(callback: types.CallbackQuery):
+    index = int(callback.data.split(":", 1)[1])
+    history = load_history()
+
+    if index >= len(history):
+        await callback.answer("Запис не знайдено.", show_alert=True)
+        return
+
+    entry = history[index]
+    await callback.answer()
+    await callback.message.answer(
+        f"🔗 Посилання для <b>{entry['gallery_name']}</b>:\n<code>{entry['url']}</code>",
+        reply_markup=build_main_menu()
     )
 
 
