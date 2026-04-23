@@ -465,7 +465,7 @@ async def get_url_callback(callback: types.CallbackQuery):
     entry = history[index]
     await callback.answer()
     await callback.message.answer(
-        f"🔗 Посилання для <b>{entry['gallery_name']}</b>:\n<code>{entry['url']}</code>",
+        f"🔗 Посилання для <b>{entry['gallery_name']}</b>:\n<a href=\"{entry['url']}\">{entry['url']}</a>",
         reply_markup=build_main_menu()
     )
 
