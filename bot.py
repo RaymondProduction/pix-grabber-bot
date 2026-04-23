@@ -27,6 +27,7 @@ BASE_DOWNLOAD_DIR = Path("images")
 BASE_DOWNLOAD_DIR.mkdir(exist_ok=True)
 
 HISTORY_FILE = Path("history.json")
+PENDING_PARTIAL_REQUESTS = {}
 
 
 def load_history() -> list:
@@ -74,6 +75,83 @@ def build_main_menu() -> InlineKeyboardMarkup:
     ])
 
 
+def get_image_names_from_zip(zip_path: Path) -> list[str]:
+    with zipfile.ZipFile(zip_path, 'r') as zf:
+        return [
+            name for name in zf.namelist()
+            if Path(name).suffix.lower() in {'.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp'}
+            and not name.endswith('/')
+        ]
+
+
+def build_history_actions_keyboard(index: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📦 Переслати архів", callback_data=f"resend:{index}")],
+        [InlineKeyboardButton(text="🖼 Переслати частину фото", callback_data=f"partial:{index}")],
+        [InlineKeyboardButton(text="⬅️ До історії", callback_data="show_history")]
+    ])
+
+
+def parse_photo_selection(text: str, max_count: int) -> list[int]:
+    normalized = text.strip().replace(' ', '')
+    if not normalized:
+        raise ValueError("Порожній список.")
+
+    indices = set()
+    for part in normalized.split(','):
+        if not part:
+            continue
+
+        if '-' in part:
+            start_str, end_str = part.split('-', 1)
+            if not start_str.isdigit() or not end_str.isdigit():
+                raise ValueError("Некоректний діапазон.")
+            start = int(start_str)
+            end = int(end_str)
+            if start > end:
+                raise ValueError("У діапазоні початок більший за кінець.")
+            for value in range(start, end + 1):
+                if value < 1 or value > max_count:
+                    raise ValueError(f"Номер {value} поза межами 1..{max_count}.")
+                indices.add(value - 1)
+        else:
+            if not part.isdigit():
+                raise ValueError("Некоректний номер.")
+            value = int(part)
+            if value < 1 or value > max_count:
+                raise ValueError(f"Номер {value} поза межами 1..{max_count}.")
+            indices.add(value - 1)
+
+    result = sorted(indices)
+    if not result:
+        raise ValueError("Не вибрано жодного фото.")
+    return result
+
+
+async def send_selected_images(zip_path: Path, image_names: list[str], selected_indexes: list[int], message: types.Message):
+    selected_names = [image_names[i] for i in selected_indexes]
+
+    with zipfile.ZipFile(zip_path, 'r') as zf:
+        batch = []
+        sent_count = 0
+
+        for idx, image_name in enumerate(selected_names, start=1):
+            data = zf.read(image_name)
+            batch.append(
+                types.InputMediaPhoto(
+                    media=types.BufferedInputFile(data, filename=Path(image_name).name),
+                    caption=f"🖼 {Path(image_name).name}" if len(batch) == 0 else None
+                )
+            )
+
+            if len(batch) == 10 or idx == len(selected_names):
+                await message.answer_media_group(batch)
+                sent_count += len(batch)
+                batch = []
+
+        await message.answer(f"✅ Відправлено {sent_count} фото.", reply_markup=build_main_menu())
+
+
 async def send_history(message: types.Message):
     history = load_history()
     if not history:
@@ -84,7 +162,7 @@ async def send_history(message: types.Message):
     for i, entry in enumerate(reversed(history)):
         real_index = len(history) - 1 - i
         label = f"{'✅' if Path(entry['zip_path']).exists() else '❌'} {entry['gallery_name'][:40]} ({entry['image_count']} шт.) — {entry['date']}"
-        buttons.append([InlineKeyboardButton(text=label, callback_data=f"resend:{real_index}")])
+        buttons.append([InlineKeyboardButton(text=label, callback_data=f"history_item:{real_index}")])
 
     buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_start")])
 
@@ -180,8 +258,81 @@ async def back_to_start_callback(callback: types.CallbackQuery):
     await callback.answer()
     await callback.message.answer(
         "👋 <b>PixGrabber Bot</b>\n\n"
-        "Надішли посилання — я запитаю режим скачування.",
+        "Надішли посилання — для завантаження.",
         reply_markup=build_main_menu()
+    )
+
+
+@dp.callback_query(F.data.startswith("history_item:"))
+async def history_item_callback(callback: types.CallbackQuery):
+    index = int(callback.data.split(":", 1)[1])
+    history = load_history()
+
+    if index >= len(history):
+        await callback.answer("Запис не знайдено.", show_alert=True)
+        return
+
+    entry = history[index]
+    zip_path = Path(entry["zip_path"])
+
+    if not zip_path.exists():
+        await callback.answer("Файл більше не існує на диску.", show_alert=True)
+        return
+
+    await callback.answer()
+    await callback.message.answer(
+        f"📁 <b>{entry['gallery_name']}</b>\n"
+        f"🖼 Зображень: {entry['image_count']}\n"
+        f"📅 {entry['date']}\n"
+        f"🔗 {entry['url']}",
+        reply_markup=build_history_actions_keyboard(index)
+    )
+
+
+@dp.callback_query(F.data.startswith("partial:"))
+async def partial_resend_request(callback: types.CallbackQuery):
+    index = int(callback.data.split(":", 1)[1])
+    history = load_history()
+
+    if index >= len(history):
+        await callback.answer("Запис не знайдено.", show_alert=True)
+        return
+
+    entry = history[index]
+    zip_path = Path(entry["zip_path"])
+
+    if not zip_path.exists():
+        await callback.answer("Архів не знайдено.", show_alert=True)
+        return
+
+    try:
+        image_names = get_image_names_from_zip(zip_path)
+    except Exception as e:
+        logging.error(f"Не вдалося прочитати ZIP {zip_path}: {e}")
+        await callback.answer("Не вдалося відкрити архів.", show_alert=True)
+        return
+
+    if not image_names:
+        await callback.answer("У архіві немає зображень.", show_alert=True)
+        return
+
+    PENDING_PARTIAL_REQUESTS[callback.from_user.id] = {
+        "history_index": index,
+        "zip_path": str(zip_path),
+        "image_count": len(image_names)
+    }
+
+    preview_count = min(10, len(image_names))
+    preview_lines = [f"{i + 1}. {Path(image_names[i]).name}" for i in range(preview_count)]
+    preview_text = "\n".join(preview_lines)
+
+    await callback.answer()
+    await callback.message.answer(
+        f"🖼 <b>{entry['gallery_name']}</b>\n"
+        f"В архіві <b>{len(image_names)}</b> фото.\n\n"
+        f"Надішли номери фото або діапазон.\n"
+        f"Приклади: <code>1-5</code>, <code>1,3,7</code>, <code>2-4,8</code>\n\n"
+        f"Перші {preview_count} фото:\n{preview_text}"
     )
 
 
@@ -285,6 +436,36 @@ async def cmd_start(message: types.Message):
 async def on_link(message: types.Message):
     url = message.text.strip()
     asyncio.create_task(handle_url(message, url))
+
+
+@dp.message(F.text)
+async def handle_partial_selection(message: types.Message):
+    pending = PENDING_PARTIAL_REQUESTS.get(message.from_user.id)
+    if not pending:
+        return
+
+    zip_path = Path(pending["zip_path"])
+    if not zip_path.exists():
+        PENDING_PARTIAL_REQUESTS.pop(message.from_user.id, None)
+        await message.answer("Архів більше не знайдено.", reply_markup=build_main_menu())
+        return
+
+    try:
+        image_names = get_image_names_from_zip(zip_path)
+        selected_indexes = parse_photo_selection(message.text, len(image_names))
+    except ValueError as e:
+        await message.answer(
+            f"⚠️ {e}\n\nСпробуй ще раз. Приклади: <code>1-5</code>, <code>1,3,7</code>, <code>2-4,8</code>"
+        )
+        return
+    except Exception as e:
+        logging.error(f"Помилка вибору частини фото: {e}")
+        PENDING_PARTIAL_REQUESTS.pop(message.from_user.id, None)
+        await message.answer("Не вдалося прочитати архів.", reply_markup=build_main_menu())
+        return
+
+    PENDING_PARTIAL_REQUESTS.pop(message.from_user.id, None)
+    await send_selected_images(zip_path, image_names, selected_indexes, message)
 
 
 async def main():
