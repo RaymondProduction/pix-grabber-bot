@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import re
+from typing import Optional
 from pathlib import Path
 import zipfile
 from datetime import datetime
@@ -60,7 +61,7 @@ def get_site_config(url: str):
     return CONFIG.get("default", {})
 
 
-def extract_resume_url(text: str) -> str | None:
+def extract_resume_url(text: str) -> Optional[str]:
     urls = re.findall(r'https?://[^\s<>"\']+', text)
     if urls:
         return urls[-1]
