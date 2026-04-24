@@ -80,7 +80,8 @@ def get_site_config(url: str):
 
 
 def extract_resume_url(text: str) -> Optional[str]:
-    match = re.search(r"Use '([^']+)' as input URL to continue downloading", text)
+    # gallery-dl пише: Use 'URL' або "URL" as input URL to continue downloading
+    match = re.search(r"Use ['\"]([^'\"]+)['\"] as input URL to continue", text)
     if match:
         return match.group(1)
 
@@ -92,7 +93,7 @@ def extract_resume_url(text: str) -> Optional[str]:
 
 async def send_start_menu(message: types.Message):
     await message.answer(
-        "👋 <b>PixGrabber Bot</b>\n\n"
+        "👏🏽 <b>PixGrabber Bot</b>\n\n"
         "Надішли посилання — для завантаження.",
         reply_markup=build_main_menu()
     )
@@ -554,6 +555,7 @@ async def partial_resend_request(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data.startswith("resume:"))
 async def resume_download(callback: types.CallbackQuery):
+    global queue_worker_started
     index = int(callback.data.split(":", 1)[1])
     history = load_history()
 
@@ -565,9 +567,15 @@ async def resume_download(callback: types.CallbackQuery):
     resume_url = entry.get("resume_url")
     download_dir_value = entry.get("download_dir")
 
-    if not resume_url or not download_dir_value:
+    if not resume_url:
         await callback.answer("Немає даних для докачки.", show_alert=True)
         return
+
+    # Якщо download_dir з якоїсь причини відсутній — створюємо новий
+    if not download_dir_value:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        download_dir_value = str(BASE_DOWNLOAD_DIR / f"{timestamp}_{urlparse(resume_url).netloc}")
+        update_history_entry(index, download_dir=download_dir_value)
 
     await callback.answer()
     position = download_queue.qsize()
@@ -577,10 +585,10 @@ async def resume_download(callback: types.CallbackQuery):
         await callback.message.answer(f"⏩ Докачку додано в чергу. Позиція: {position}")
 
     update_history_entry(index, status="in_progress")
-
     await download_queue.put((callback.message, resume_url, index, Path(download_dir_value)))
 
     if not queue_worker_started:
+        queue_worker_started = True
         asyncio.create_task(queue_worker())
 
 
