@@ -32,7 +32,7 @@ download_queue: asyncio.Queue = asyncio.Queue()
 queue_worker_started = False
 active_downloads = 0
 
-IMAGE_EXTENSIONS = IMAGE_EXTENSIONS
+IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp'}
 MAX_ARCHIVE_PART_SIZE = int(CONFIG.get("max_archive_part_size_mb", 45)) * 1024 * 1024
 
 
