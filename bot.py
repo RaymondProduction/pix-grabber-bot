@@ -55,7 +55,9 @@ def add_history_entry(url: str, download_dir: str) -> int:
         "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
         "status": "in_progress",
         "resume_url": "",
-        "download_dir": download_dir
+        "download_dir": download_dir,
+        "archive_chat_id": "",
+        "archive_message_id": ""
     })
     save_history(history)
     return len(history) - 1
@@ -220,7 +222,7 @@ async def send_history(message: types.Message):
 
         if status == "interrupted":
             marker = "⏸"
-        elif Path(entry.get("zip_path", "")).exists():
+        elif Path(entry.get("zip_path", "")).exists() or entry.get("archive_message_id"):
             marker = "✅"
         elif status == "in_progress":
             marker = "🟡"
@@ -308,9 +310,14 @@ async def create_and_send_zip(folder: Path, message: types.Message, history_inde
 
     try:
         data = zip_path.read_bytes()
-        await message.answer_document(
+        sent_message = await message.answer_document(
             types.BufferedInputFile(data, filename=zip_filename),
             caption=f"📦 Готово!\nЗображень: {len(images)}\nНазва: {gallery_name}",
+        )
+        update_history_entry(
+            history_index,
+            archive_chat_id=str(sent_message.chat.id),
+            archive_message_id=sent_message.message_id
         )
         await send_start_menu(message)
     except Exception as e:
@@ -463,7 +470,7 @@ async def history_item_callback(callback: types.CallbackQuery):
         )
         return
 
-    if not zip_path.exists():
+    if not zip_path.exists() and not entry.get("archive_message_id"):
         await callback.message.answer(
             f"⚠️ Архів для <b>{entry['gallery_name']}</b> недоступний або був видалений.\n\n"
             f"Можна спробувати скачати його наново з цього посилання:\n{entry['url']}",
@@ -639,6 +646,21 @@ async def resend_zip(callback: types.CallbackQuery):
         )
         return
 
+    archive_message_id = entry.get("archive_message_id")
+    archive_chat_id = entry.get("archive_chat_id") or callback.message.chat.id
+
+    if archive_message_id:
+        try:
+            await bot.forward_message(
+                chat_id=callback.message.chat.id,
+                from_chat_id=int(archive_chat_id),
+                message_id=int(archive_message_id)
+            )
+            await callback.message.answer("✅ Архів переслано з історії Telegram.", reply_markup=build_main_menu())
+            return
+        except Exception as e:
+            logging.error(f"Не вдалося переслати архів з Telegram history: {e}")
+
     if not zip_path.exists():
         await callback.message.answer(
             "⚠️ Архів недоступний або був видалений.\n"
@@ -648,10 +670,15 @@ async def resend_zip(callback: types.CallbackQuery):
         return
 
     data = zip_path.read_bytes()
-    await callback.message.answer_document(
+    sent_message = await callback.message.answer_document(
         types.BufferedInputFile(data, filename=zip_path.name),
         caption=f"📦 {entry['gallery_name']}\n🖼 {entry['image_count']} зображень\n📅 {entry['date']}\n🔗 {entry['url']}",
         reply_markup=build_main_menu()
+    )
+    update_history_entry(
+        index,
+        archive_chat_id=str(sent_message.chat.id),
+        archive_message_id=sent_message.message_id
     )
 
 
