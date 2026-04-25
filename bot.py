@@ -2,6 +2,8 @@ import asyncio
 import json
 import logging
 import re
+import html
+import signal
 from typing import Optional
 from pathlib import Path
 import zipfile
@@ -43,6 +45,8 @@ IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp'}
 MAX_ARCHIVE_PART_SIZE = int(CONFIG.get("max_archive_part_size_mb", 45)) * 1024 * 1024
 ARCHIVE_FLUSH_RATIO = float(CONFIG.get("archive_flush_ratio", 0.90))
 ARCHIVE_FLUSH_SIZE = max(1, int(MAX_ARCHIVE_PART_SIZE * ARCHIVE_FLUSH_RATIO))
+# Скільки секунд чекати нову картинку перед тим як зробити Ctrl+C
+STALL_TIMEOUT = int(CONFIG.get("stall_timeout_sec", 20))
 
 
 
@@ -216,6 +220,7 @@ def find_done_history_entry_by_url(url: str) -> Optional[int]:
     return best_index
 
 def extract_resume_url(text: str) -> Optional[str]:
+    # gallery-dl пише: Use 'URL' або "URL" as input URL to continue downloading
     match = re.search(r"Use ['\"]([^'\"]+)['\"] as input URL to continue", text)
     if match:
         return match.group(1)
@@ -915,6 +920,7 @@ async def monitor_folder_and_send_archives(folder: Path, message: types.Message,
                 # 2) Ту саму картинку додаємо в буфер для потокового ZIP.
                 state["pending_files"].append(file_path)
                 state["processed_files"].add(key)
+                state["last_image_at"] = asyncio.get_running_loop().time()
                 new_images.append(file_path)
 
             if new_images and not state.get("preview_sent"):
@@ -942,6 +948,7 @@ async def flush_remaining_downloaded_images(folder: Path, message: types.Message
             await send_live_downloaded_image(message, file_path, state)
             state["pending_files"].append(file_path)
             state["processed_files"].add(key)
+            state["last_image_at"] = asyncio.get_running_loop().time()
 
     remaining_images = [img for img in state["pending_files"] if img.exists()]
     state["pending_files"] = []
@@ -979,6 +986,20 @@ async def finalize_streaming_archives(folder: Path, message: types.Message, hist
 
 
 
+async def _read_stream_lines(stream: asyncio.StreamReader) -> list[str]:
+    """Зчитує всі рядки зі стриму до EOF."""
+    lines = []
+    while True:
+        try:
+            line = await stream.readline()
+        except Exception:
+            break
+        if not line:
+            break
+        lines.append(line.decode("utf-8", errors="ignore").rstrip("\n"))
+    return lines
+
+
 async def run_download(message: types.Message, url: str, history_index: int, download_dir: Path):
     cfg = get_site_config(url)
     username = cfg.get("username")
@@ -1010,6 +1031,7 @@ async def run_download(message: types.Message, url: str, history_index: int, dow
         stderr=asyncio.subprocess.PIPE
     )
 
+    loop = asyncio.get_running_loop()
     archive_state = {
         "processed_files": set(),
         "live_sent_files": set(),
@@ -1021,25 +1043,150 @@ async def run_download(message: types.Message, url: str, history_index: int, dow
         "part_number": 0,
         "preview_sent": False,
         "gallery_name": "",
-        "safe_name": ""
+        "safe_name": "",
+        "last_image_at": loop.time()
     }
+
+    # Буфер для накопичення рядків з stdout/stderr
+    output_lines: list[str] = []
+    sent_error_lines: set[str] = set()
+    stall_triggered = False
+
+    def _is_gallery_error_line(line: str) -> bool:
+        line_lower = line.lower()
+        return any(kw in line_lower for kw in (
+            "error", "warning", "exception", "failed", "forbidden",
+            "unauthorized", "timeout", "timed out", "403", "404", "429", "ssl"
+        ))
+
+    async def _send_gallery_log(lines: list[str], title: str = "⚠️ <b>Лог gallery-dl:</b>"):
+        if not lines:
+            return
+
+        text = "\n".join(lines[-20:])
+        try:
+            await message.answer(f"{title}\n<pre>{html.escape(text[:3000])}</pre>")
+        except Exception as e:
+            logging.error(f"Не вдалося відправити лог gallery-dl: {e}")
+
+    async def _pipe_reader(stream: asyncio.StreamReader, stream_name: str):
+        """Читає stdout/stderr у реальному часі та одразу показує помилки в чаті."""
+        pending_errors: list[str] = []
+        last_error_sent_at = 0.0
+
+        while True:
+            try:
+                line = await stream.readline()
+            except Exception:
+                break
+            if not line:
+                break
+            decoded = line.decode("utf-8", errors="ignore").rstrip("\n")
+            if not decoded:
+                continue
+
+            tagged_line = f"[{stream_name}] {decoded}"
+            output_lines.append(tagged_line)
+            logging.info(f"[gallery-dl] {tagged_line}")
+
+            if _is_gallery_error_line(decoded) and tagged_line not in sent_error_lines:
+                sent_error_lines.add(tagged_line)
+                pending_errors.append(tagged_line)
+
+            now = loop.time()
+            if pending_errors and now - last_error_sent_at >= 5:
+                await _send_gallery_log(pending_errors)
+                pending_errors = []
+                last_error_sent_at = now
+
+        if pending_errors:
+            await _send_gallery_log(pending_errors)
+
+    async def _stop_process_by_interrupt():
+        if process.returncode is not None:
+            return
+
+        try:
+            process.send_signal(signal.SIGINT)
+        except ProcessLookupError:
+            return
+        except Exception as e:
+            logging.error(f"[watchdog] Не вдалося надіслати SIGINT: {e}")
+            return
+
+        try:
+            await asyncio.wait_for(process.wait(), timeout=10)
+        except asyncio.TimeoutError:
+            logging.warning("[watchdog] gallery-dl не завершився після SIGINT — робимо kill")
+            try:
+                process.kill()
+            except Exception:
+                pass
+
+    async def _watchdog():
+        """Перериває gallery-dl, якщо нова картинка не з'являється довше STALL_TIMEOUT."""
+        nonlocal stall_triggered
+
+        while process.returncode is None:
+            await asyncio.sleep(1)
+            elapsed = loop.time() - archive_state.get("last_image_at", loop.time())
+            if elapsed < STALL_TIMEOUT:
+                continue
+
+            logging.warning(f"[watchdog] Немає нових картинок {STALL_TIMEOUT}с — надсилаємо SIGINT")
+            stall_triggered = True
+            await message.answer(
+                f"⏱ Нова картинка не з'являлась більше {STALL_TIMEOUT} сек — "
+                f"роблю Ctrl+C для gallery-dl."
+            )
+            await _stop_process_by_interrupt()
+            return
+
     monitor_task = asyncio.create_task(
         monitor_folder_and_send_archives(download_dir, message, history_index, archive_state)
     )
+    stdout_task = asyncio.create_task(_pipe_reader(process.stdout, "stdout"))
+    stderr_task = asyncio.create_task(_pipe_reader(process.stderr, "stderr"))
+    watchdog_task = asyncio.create_task(_watchdog())
 
     try:
-        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=1800)
+        await asyncio.wait_for(process.wait(), timeout=1800)
+    except asyncio.TimeoutError:
+        logging.warning("gallery-dl: загальний таймаут 30 хв — примусово завершуємо")
+        stall_triggered = True
+        await _stop_process_by_interrupt()
     finally:
+        watchdog_task.cancel()
         monitor_task.cancel()
+        for t in (watchdog_task, monitor_task):
+            try:
+                await t
+            except asyncio.CancelledError:
+                pass
+
         try:
-            await monitor_task
-        except asyncio.CancelledError:
-            pass
+            await asyncio.wait_for(
+                asyncio.gather(stdout_task, stderr_task, return_exceptions=True),
+                timeout=5
+            )
+        except asyncio.TimeoutError:
+            stdout_task.cancel()
+            stderr_task.cancel()
 
-    error_text = (stderr or b"").decode('utf-8', errors='ignore') + (stdout or b"").decode('utf-8', errors='ignore')
-    resume_url = extract_resume_url(error_text)
+    full_output = "\n".join(output_lines)
+    resume_url = extract_resume_url(full_output)
 
-    if process.returncode != 0 or resume_url:
+    error_lines = [ln for ln in output_lines if _is_gallery_error_line(ln)]
+    unsent_error_lines = [ln for ln in error_lines if ln not in sent_error_lines]
+    if unsent_error_lines:
+        await _send_gallery_log(unsent_error_lines)
+
+    if stall_triggered:
+        await _send_gallery_log(output_lines, title="📋 <b>Останній лог gallery-dl перед зупинкою:</b>")
+
+    interrupted = (process.returncode != 0) or resume_url or stall_triggered
+
+    if interrupted:
         await flush_remaining_downloaded_images(download_dir, message, history_index, archive_state)
         update_history_entry(
             history_index,
@@ -1052,14 +1199,15 @@ async def run_download(message: types.Message, url: str, history_index: int, dow
             download_dir=str(download_dir)
         )
 
-        # При перериванні теж чистимо — архів частин вже збережено в ZIP.
         cleanup_all_downloaded_images(archive_state)
 
+        resume_text = f"\n🔁 Resume URL: {resume_url}" if resume_url else "\n🔁 Resume URL не знайдено в лозі gallery-dl."
         await message.answer(
             f"⚠️ Скачування перервано або неповне.\n"
             f"Збережено те, що встигло.\n"
             f"📦 Архівних частин: {len(archive_state['zip_paths'])}\n"
             f"🖼 Зображень: {archive_state['image_count']}"
+            f"{resume_text}"
         )
 
         if resume_url:
