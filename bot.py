@@ -5,6 +5,7 @@ import re
 from typing import Optional
 from pathlib import Path
 import zipfile
+import shutil
 from datetime import datetime
 from urllib.parse import urlparse
 
@@ -25,6 +26,11 @@ dp = Dispatcher()
 
 BASE_DOWNLOAD_DIR = Path("images")
 BASE_DOWNLOAD_DIR.mkdir(exist_ok=True)
+
+ARCHIVE_DIR = Path("arhive")
+ARCHIVE_DIR.mkdir(exist_ok=True)
+
+HISTORY_PAGE_SIZE = 5
 
 HISTORY_FILE = Path("history.json")
 PENDING_PARTIAL_REQUESTS = {}
@@ -93,6 +99,62 @@ def delete_history_entry(index: int) -> Optional[dict]:
     return deleted_entry
 
 
+def get_history_page_count(total_items: int) -> int:
+    if total_items <= 0:
+        return 1
+    return (total_items + HISTORY_PAGE_SIZE - 1) // HISTORY_PAGE_SIZE
+
+
+def normalize_history_page(page: int, total_items: int) -> int:
+    page_count = get_history_page_count(total_items)
+    return max(0, min(page, page_count - 1))
+
+
+def make_unique_path(target_path: Path) -> Path:
+    if not target_path.exists():
+        return target_path
+
+    stem = target_path.stem
+    suffix = target_path.suffix
+    parent = target_path.parent
+    counter = 1
+
+    while True:
+        candidate = parent / f"{stem}_{counter}{suffix}"
+        if not candidate.exists():
+            return candidate
+        counter += 1
+
+
+def move_entry_archives_to_archive_dir(index: int) -> tuple[int, list[str]]:
+    history = load_history()
+    if index < 0 or index >= len(history):
+        return 0, []
+
+    entry = history[index]
+    zip_parts = get_zip_parts(entry)
+    moved_paths = []
+
+    for zip_path in zip_parts:
+        if not zip_path.exists() or not zip_path.is_file():
+            continue
+
+        try:
+            target_path = make_unique_path(ARCHIVE_DIR / zip_path.name)
+            shutil.move(str(zip_path), str(target_path))
+            moved_paths.append(str(target_path))
+        except Exception as e:
+            logging.error(f"Не вдалося перенести архів {zip_path} в {ARCHIVE_DIR}: {e}")
+
+    if moved_paths:
+        entry["zip_parts"] = moved_paths
+        entry["zip_path"] = moved_paths[0]
+        entry["archived_at"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+        save_history(history)
+
+    return len(moved_paths), moved_paths
+
+
 def get_site_config(url: str):
     url_lower = url.lower()
     for domain, cfg in CONFIG.get("sites", {}).items():
@@ -154,6 +216,7 @@ def build_history_actions_keyboard(index: int, url: str) -> InlineKeyboardMarkup
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📦 Переслати архів", callback_data=f"resend:{index}")],
         [InlineKeyboardButton(text="🖼 Переслати частину фото", callback_data=f"partial:{index}")],
+        [InlineKeyboardButton(text="📁 Архів", callback_data=f"archive_item:{index}")],
         [InlineKeyboardButton(text="🔗 Отримати посилання", callback_data=f"get_url:{index}")],
         [InlineKeyboardButton(text="🗑 Видалити з історії", callback_data=f"delete_history_item:{index}")],
         [InlineKeyboardButton(text="⬅️ До історії", callback_data="show_history")]
@@ -387,14 +450,21 @@ async def send_selected_images(zip_path: Path, image_names: list[str], selected_
     await send_selected_images_from_refs(image_refs, selected_indexes, message)
 
 
-async def send_history(message: types.Message):
+async def send_history(message: types.Message, page: int = 0):
     history = load_history()
     if not history:
         await message.answer("Історія порожня.", reply_markup=build_main_menu())
         return
 
+    page = normalize_history_page(page, len(history))
+    page_count = get_history_page_count(len(history))
+    start_index = page * HISTORY_PAGE_SIZE
+    end_index = start_index + HISTORY_PAGE_SIZE
+    reversed_items = list(enumerate(reversed(history)))
+    page_items = reversed_items[start_index:end_index]
+
     buttons = []
-    for i, entry in enumerate(reversed(history)):
+    for i, entry in page_items:
         real_index = len(history) - 1 - i
         status = entry.get("status", "done")
 
@@ -410,12 +480,23 @@ async def send_history(message: types.Message):
         label = f"{marker} {entry['gallery_name'][:40]} ({entry['image_count']} шт.) — {entry['date']}"
         buttons.append([InlineKeyboardButton(text=label, callback_data=f"history_item:{real_index}")])
 
+    navigation_buttons = []
+    if page > 0:
+        navigation_buttons.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"history_page:{page - 1}"))
+    if page < page_count - 1:
+        navigation_buttons.append(InlineKeyboardButton(text="➡️ Далі", callback_data=f"history_page:{page + 1}"))
+    if navigation_buttons:
+        buttons.append(navigation_buttons)
+
     buttons.append([InlineKeyboardButton(text="⬇️ Скачати JSON з історією", callback_data="export_history_json")])
     buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_start")])
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
-    await message.answer(f"📋 Історія завантажень ({len(history)} шт.):", reply_markup=keyboard)
-
+    await message.answer(
+        f"📋 Історія завантажень ({len(history)} шт.)\n"
+        f"Сторінка {page + 1}/{page_count}. Показано до {HISTORY_PAGE_SIZE} записів:",
+        reply_markup=keyboard
+    )
 
 async def monitor_folder(folder: Path, message: types.Message, sent_files: set):
     while True:
@@ -586,7 +667,14 @@ async def handle_url(message: types.Message, url: str):
 @dp.callback_query(F.data == "show_history")
 async def show_history_callback(callback: types.CallbackQuery):
     await callback.answer()
-    await send_history(callback.message)
+    await send_history(callback.message, page=0)
+
+
+@dp.callback_query(F.data.startswith("history_page:"))
+async def history_page_callback(callback: types.CallbackQuery):
+    page = int(callback.data.split(":", 1)[1])
+    await callback.answer()
+    await send_history(callback.message, page=page)
 
 
 @dp.callback_query(F.data == "export_history_json")
@@ -692,6 +780,36 @@ async def delete_history_item_callback(callback: types.CallbackQuery):
         f"🗑 Видалено з історії: <b>{deleted_entry.get('gallery_name', 'Без назви')}</b>\n"
         "Файли архіву на диску не видаляв.",
         reply_markup=build_main_menu()
+    )
+
+
+@dp.callback_query(F.data.startswith("archive_item:"))
+async def archive_item_callback(callback: types.CallbackQuery):
+    index = int(callback.data.split(":", 1)[1])
+    history = load_history()
+
+    if index >= len(history):
+        await callback.answer("Запис не знайдено.", show_alert=True)
+        return
+
+    entry = history[index]
+    moved_count, moved_paths = move_entry_archives_to_archive_dir(index)
+
+    await callback.answer()
+
+    if moved_count == 0:
+        await callback.message.answer(
+            f"⚠️ Не знайшов ZIP-файлів для перенесення у папку <code>{ARCHIVE_DIR}</code>.\n"
+            "Можливо, архів уже перенесений, видалений або доступний тільки через Telegram history.",
+            reply_markup=build_history_actions_keyboard(index, entry.get("url", ""))
+        )
+        return
+
+    await callback.message.answer(
+        f"📁 Переніс архів у папку <code>{ARCHIVE_DIR}</code>.\n"
+        f"Файлів перенесено: {moved_count}\n"
+        f"Перший файл: <code>{Path(moved_paths[0]).name}</code>",
+        reply_markup=build_history_actions_keyboard(index, entry.get("url", ""))
     )
 
 
