@@ -163,6 +163,47 @@ def get_site_config(url: str):
     return CONFIG.get("default", {})
 
 
+
+
+def normalize_gallery_url(url: str) -> str:
+    parsed = urlparse(url.strip())
+    return parsed._replace(query="", fragment="").geturl().rstrip("/")
+
+
+def find_done_history_entry_by_url(url: str) -> Optional[int]:
+    target_url = normalize_gallery_url(url)
+    history = load_history()
+
+    best_index = None
+    best_score = -1
+
+    for index, entry in enumerate(history):
+        if normalize_gallery_url(entry.get("url", "")) != target_url:
+            continue
+
+        if entry.get("status", "done") != "done":
+            continue
+
+        if not entry.get("zip_path") and not entry.get("zip_parts") and not entry.get("archive_messages") and not entry.get("archive_message_id"):
+            continue
+
+        score = 0
+        if entry.get("archive_messages") or entry.get("archive_message_id"):
+            score += 100
+        if entry.get("preview_message") or entry.get("preview_message_id"):
+            score += 50
+        if entry.get("zip_parts"):
+            score += 20
+        if entry.get("zip_path"):
+            score += 10
+        score += index
+
+        if score > best_score:
+            best_score = score
+            best_index = index
+
+    return best_index
+
 def extract_resume_url(text: str) -> Optional[str]:
     # gallery-dl пише: Use 'URL' або "URL" as input URL to continue downloading
     match = re.search(r"Use ['\"]([^'\"]+)['\"] as input URL to continue", text)
@@ -656,6 +697,20 @@ async def queue_worker():
 
 
 async def handle_url(message: types.Message, url: str):
+    existing_index = find_done_history_entry_by_url(url)
+    if existing_index is not None:
+        history = load_history()
+        entry = history[existing_index]
+        await message.answer(
+            f"♻️ Це посилання вже є в історії і архів уже скачано.\n\n"
+            f"📁 <b>{entry['gallery_name']}</b>\n"
+            f"🖼 Зображень: {entry['image_count']}\n"
+            f"📅 {entry['date']}\n\n"
+            f"Відправляю готовий архів з історії."
+        )
+        await send_existing_archive_from_history(message, existing_index)
+        return
+
     await message.answer(f"🔄 Посилання прийнято: <b>{urlparse(url).netloc}</b>")
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📸 Грабуємо 👏🏽", callback_data=f"mode:new:{url}")],
@@ -935,23 +990,19 @@ async def process_mode(callback: types.CallbackQuery):
         asyncio.create_task(queue_worker())
 
 
-@dp.callback_query(F.data.startswith("resend:"))
-async def resend_zip(callback: types.CallbackQuery):
-    index = int(callback.data.split(":", 1)[1])
+async def send_existing_archive_from_history(message: types.Message, index: int):
     history = load_history()
 
-    if index >= len(history):
-        await callback.answer("Запис не знайдено.", show_alert=True)
+    if index < 0 or index >= len(history):
+        await message.answer("Запис не знайдено.", reply_markup=build_main_menu())
         return
 
     entry = history[index]
     zip_parts = get_zip_parts(entry)
     existing_zip_parts = [zip_path for zip_path in zip_parts if zip_path.exists()]
 
-    await callback.answer()
-
     if entry.get("status") == "interrupted" and entry.get("resume_url"):
-        await callback.message.answer(
+        await message.answer(
             "⚠️ Це скачування ще не завершене. Можна докачати:",
             reply_markup=build_resume_keyboard(index)
         )
@@ -960,14 +1011,14 @@ async def resend_zip(callback: types.CallbackQuery):
     preview_message = entry.get("preview_message") or {}
     if not preview_message and entry.get("preview_message_id"):
         preview_message = {
-            "chat_id": entry.get("preview_chat_id") or callback.message.chat.id,
+            "chat_id": entry.get("preview_chat_id") or message.chat.id,
             "message_id": entry.get("preview_message_id")
         }
 
     archive_messages = entry.get("archive_messages") or []
     if not archive_messages and entry.get("archive_message_id"):
         archive_messages = [{
-            "chat_id": entry.get("archive_chat_id") or callback.message.chat.id,
+            "chat_id": entry.get("archive_chat_id") or message.chat.id,
             "message_id": entry.get("archive_message_id")
         }]
 
@@ -977,8 +1028,8 @@ async def resend_zip(callback: types.CallbackQuery):
     if preview_message:
         try:
             await bot.forward_message(
-                chat_id=callback.message.chat.id,
-                from_chat_id=int(preview_message.get("chat_id") or callback.message.chat.id),
+                chat_id=message.chat.id,
+                from_chat_id=int(preview_message.get("chat_id") or message.chat.id),
                 message_id=int(preview_message["message_id"])
             )
             preview_forwarded_or_sent = True
@@ -995,7 +1046,7 @@ async def resend_zip(callback: types.CallbackQuery):
                 with zipfile.ZipFile(first_ref["zip_path"], 'r') as zf:
                     preview_data = zf.read(first_ref["image_name"])
 
-                sent_preview = await callback.message.answer_photo(
+                sent_preview = await message.answer_photo(
                     types.BufferedInputFile(preview_data, filename=Path(first_ref["image_name"]).name),
                     caption=(
                         f"🖼 Превʼю архіву\n"
@@ -1024,14 +1075,14 @@ async def resend_zip(callback: types.CallbackQuery):
         try:
             for archive_message in archive_messages:
                 await bot.forward_message(
-                    chat_id=callback.message.chat.id,
-                    from_chat_id=int(archive_message.get("chat_id") or callback.message.chat.id),
+                    chat_id=message.chat.id,
+                    from_chat_id=int(archive_message.get("chat_id") or message.chat.id),
                     message_id=int(archive_message["message_id"])
                 )
                 forwarded_count += 1
 
             preview_text = " + превʼю" if preview_forwarded_or_sent else ""
-            await callback.message.answer(
+            await message.answer(
                 f"✅ Архів переслано з історії Telegram{preview_text}. Частин: {forwarded_count}",
                 reply_markup=build_main_menu()
             )
@@ -1043,7 +1094,7 @@ async def resend_zip(callback: types.CallbackQuery):
     #    Після успішної відправки оновлюємо archive_messages, щоб наступного разу можна було
     #    пересилати вже напряму з Telegram навіть без файлів на диску.
     if not existing_zip_parts:
-        await callback.message.answer(
+        await message.answer(
             "⚠️ Архів недоступний або був видалений.\n"
             "У Telegram history теж немає робочого повідомлення з архівом.\n\n"
             "Можна скачати його наново з цього посилання:",
@@ -1065,7 +1116,7 @@ async def resend_zip(callback: types.CallbackQuery):
             )
 
         data = zip_path.read_bytes()
-        sent_message = await callback.message.answer_document(
+        sent_message = await message.answer_document(
             types.BufferedInputFile(data, filename=zip_path.name),
             caption=caption,
             reply_markup=build_main_menu() if part_number == total_parts else None
@@ -1081,6 +1132,13 @@ async def resend_zip(callback: types.CallbackQuery):
         archive_message_id=sent_messages[0]["message_id"] if sent_messages else "",
         archive_messages=sent_messages
     )
+
+
+@dp.callback_query(F.data.startswith("resend:"))
+async def resend_zip(callback: types.CallbackQuery):
+    index = int(callback.data.split(":", 1)[1])
+    await callback.answer()
+    await send_existing_archive_from_history(callback.message, index)
 
 
 @dp.message(Command("history"))
