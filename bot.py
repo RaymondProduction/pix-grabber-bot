@@ -946,6 +946,7 @@ async def resend_zip(callback: types.CallbackQuery):
 
     entry = history[index]
     zip_parts = get_zip_parts(entry)
+    existing_zip_parts = [zip_path for zip_path in zip_parts if zip_path.exists()]
 
     await callback.answer()
 
@@ -963,18 +964,6 @@ async def resend_zip(callback: types.CallbackQuery):
             "message_id": entry.get("preview_message_id")
         }
 
-    preview_forwarded = False
-    if preview_message:
-        try:
-            await bot.forward_message(
-                chat_id=callback.message.chat.id,
-                from_chat_id=int(preview_message.get("chat_id") or callback.message.chat.id),
-                message_id=int(preview_message["message_id"])
-            )
-            preview_forwarded = True
-        except Exception as e:
-            logging.error(f"Не вдалося переслати превʼю з Telegram history: {e}")
-
     archive_messages = entry.get("archive_messages") or []
     if not archive_messages and entry.get("archive_message_id"):
         archive_messages = [{
@@ -982,36 +971,23 @@ async def resend_zip(callback: types.CallbackQuery):
             "message_id": entry.get("archive_message_id")
         }]
 
-    forwarded_count = 0
-    if archive_messages:
+    preview_forwarded_or_sent = False
+
+    # 1) Спочатку пробуємо показати превʼю з Telegram history.
+    if preview_message:
         try:
-            for archive_message in archive_messages:
-                await bot.forward_message(
-                    chat_id=callback.message.chat.id,
-                    from_chat_id=int(archive_message.get("chat_id") or callback.message.chat.id),
-                    message_id=int(archive_message["message_id"])
-                )
-                forwarded_count += 1
-
-            preview_text = " + превʼю" if preview_forwarded else ""
-            await callback.message.answer(
-                f"✅ Архів переслано з історії Telegram{preview_text}. Частин: {forwarded_count}",
-                reply_markup=build_main_menu()
+            await bot.forward_message(
+                chat_id=callback.message.chat.id,
+                from_chat_id=int(preview_message.get("chat_id") or callback.message.chat.id),
+                message_id=int(preview_message["message_id"])
             )
-            return
+            preview_forwarded_or_sent = True
         except Exception as e:
-            logging.error(f"Не вдалося переслати архів з Telegram history: {e}")
+            logging.error(f"Не вдалося переслати превʼю з Telegram history: {e}")
 
-    existing_zip_parts = [zip_path for zip_path in zip_parts if zip_path.exists()]
-    if not existing_zip_parts:
-        await callback.message.answer(
-            "⚠️ Архів недоступний або був видалений.\n"
-            "Можна скачати його наново з цього посилання:",
-            reply_markup=build_redownload_keyboard(entry["url"])
-        )
-        return
-
-    if not preview_forwarded:
+    # 2) Якщо preview_message ще немає або він не переслався, але ZIP є на диску —
+    #    самовідновлюємо превʼю і записуємо його message_id в history.json.
+    if not preview_forwarded_or_sent and existing_zip_parts:
         try:
             image_refs = get_image_refs_from_zip_parts(existing_zip_parts)
             if image_refs:
@@ -1027,17 +1003,53 @@ async def resend_zip(callback: types.CallbackQuery):
                         f"Зображень: {entry['image_count']}"
                     )
                 )
+                preview_message = {
+                    "chat_id": str(sent_preview.chat.id),
+                    "message_id": sent_preview.message_id
+                }
                 update_history_entry(
                     index,
-                    preview_chat_id=str(sent_preview.chat.id),
-                    preview_message_id=sent_preview.message_id,
-                    preview_message={
-                        "chat_id": str(sent_preview.chat.id),
-                        "message_id": sent_preview.message_id
-                    }
+                    preview_chat_id=preview_message["chat_id"],
+                    preview_message_id=preview_message["message_id"],
+                    preview_message=preview_message
                 )
+                preview_forwarded_or_sent = True
         except Exception as e:
             logging.error(f"Не вдалося відправити превʼю з ZIP: {e}")
+
+    # 3) Потім пробуємо переслати архів/частини з Telegram history.
+    #    Це має працювати навіть якщо локальні ZIP-файли вже видалені з сервера.
+    forwarded_count = 0
+    if archive_messages:
+        try:
+            for archive_message in archive_messages:
+                await bot.forward_message(
+                    chat_id=callback.message.chat.id,
+                    from_chat_id=int(archive_message.get("chat_id") or callback.message.chat.id),
+                    message_id=int(archive_message["message_id"])
+                )
+                forwarded_count += 1
+
+            preview_text = " + превʼю" if preview_forwarded_or_sent else ""
+            await callback.message.answer(
+                f"✅ Архів переслано з історії Telegram{preview_text}. Частин: {forwarded_count}",
+                reply_markup=build_main_menu()
+            )
+            return
+        except Exception as e:
+            logging.error(f"Не вдалося переслати архів з Telegram history: {e}")
+
+    # 4) Якщо Telegram history не спрацювала або її ще немає — fallback на локальні ZIP-файли.
+    #    Після успішної відправки оновлюємо archive_messages, щоб наступного разу можна було
+    #    пересилати вже напряму з Telegram навіть без файлів на диску.
+    if not existing_zip_parts:
+        await callback.message.answer(
+            "⚠️ Архів недоступний або був видалений.\n"
+            "У Telegram history теж немає робочого повідомлення з архівом.\n\n"
+            "Можна скачати його наново з цього посилання:",
+            reply_markup=build_redownload_keyboard(entry["url"])
+        )
+        return
 
     sent_messages = []
     total_parts = len(existing_zip_parts)
