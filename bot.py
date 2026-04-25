@@ -4,6 +4,7 @@ import logging
 import re
 import html
 import signal
+import sqlite3
 from typing import Optional
 from pathlib import Path
 import zipfile
@@ -35,8 +36,10 @@ ARCHIVE_DIR.mkdir(exist_ok=True)
 HISTORY_PAGE_SIZE = 5
 
 HISTORY_FILE = Path("history.json")
+HISTORY_DB_FILE = Path("history.sqlite3")
 PENDING_PARTIAL_REQUESTS = {}
 PENDING_SEARCH_REQUESTS = set()
+PENDING_DOWNLOAD_REQUESTS = {}
 download_queue: Optional[asyncio.Queue] = None
 queue_worker_started = False
 active_downloads = 0
@@ -58,17 +61,48 @@ def get_download_queue() -> asyncio.Queue:
 
 
 
+def get_db_connection():
+    conn = sqlite3.connect(HISTORY_DB_FILE)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_history_db():
+    with get_db_connection() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS history_entries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                data TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+        """)
+        count = conn.execute("SELECT COUNT(*) FROM history_entries").fetchone()[0]
+        if count == 0 and HISTORY_FILE.exists():
+            with open(HISTORY_FILE, 'r', encoding='utf-8') as f:
+                old_history = json.load(f)
+            for entry in old_history:
+                conn.execute(
+                    "INSERT INTO history_entries (data, created_at) VALUES (?, ?)",
+                    (json.dumps(entry, ensure_ascii=False), entry.get("date", datetime.now().strftime("%Y-%m-%d %H:%M")))
+                )
+
+
 def load_history() -> list:
-    if HISTORY_FILE.exists():
-        with open(HISTORY_FILE, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    return []
+    init_history_db()
+    with get_db_connection() as conn:
+        rows = conn.execute("SELECT data FROM history_entries ORDER BY id").fetchall()
+    return [json.loads(row["data"]) for row in rows]
 
 
 def save_history(history: list):
-    with open(HISTORY_FILE, 'w', encoding='utf-8') as f:
-        json.dump(history, f, ensure_ascii=False, indent=2)
-
+    init_history_db()
+    with get_db_connection() as conn:
+        conn.execute("DELETE FROM history_entries")
+        for entry in history:
+            conn.execute(
+                "INSERT INTO history_entries (data, created_at) VALUES (?, ?)",
+                (json.dumps(entry, ensure_ascii=False), entry.get("date", datetime.now().strftime("%Y-%m-%d %H:%M")))
+            )
 
 def add_history_entry(url: str, download_dir: str) -> int:
     history = load_history()
@@ -87,7 +121,8 @@ def add_history_entry(url: str, download_dir: str) -> int:
         "preview_chat_id": "",
         "preview_message_id": "",
         "preview_message": {},
-        "zip_parts": []
+        "zip_parts": [],
+        "image_messages": []
     })
     save_history(history)
     return len(history) - 1
@@ -258,7 +293,7 @@ def build_service_menu() -> InlineKeyboardMarkup:
 
 def build_redownload_keyboard(url: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔄 Скачати наново", callback_data=f"mode:new:{url}")],
+        [InlineKeyboardButton(text="🔄 Скачати наново", callback_data=f"mode:new:{register_download_request(url)}")],
         [InlineKeyboardButton(text="⬅️ До історії", callback_data="show_history")]
     ])
 
@@ -617,6 +652,33 @@ def cleanup_images_after_zip(images: list[Path]):
             logging.error(f"Не вдалося видалити файл {img}: {e}")
 
 
+async def forward_selected_images_from_history(image_messages: list[dict], selected_indexes: list[int], message: types.Message) -> bool:
+    if not image_messages:
+        return False
+
+    selected_messages = []
+    for index in selected_indexes:
+        if index >= len(image_messages):
+            return False
+        selected_messages.append(image_messages[index])
+
+    forwarded_count = 0
+    for image_message in selected_messages:
+        try:
+            await bot.forward_message(
+                chat_id=message.chat.id,
+                from_chat_id=int(image_message.get("chat_id") or message.chat.id),
+                message_id=int(image_message["message_id"])
+            )
+            forwarded_count += 1
+        except Exception as e:
+            logging.error(f"Не вдалося переслати фото з Telegram history: {e}")
+            return False
+
+    await message.answer(f"✅ Відправлено {forwarded_count} фото з історії Telegram.", reply_markup=build_main_menu())
+    return True
+
+
 async def send_selected_images_from_refs(image_refs: list[dict], selected_indexes: list[int], message: types.Message):
     selected_refs = [image_refs[i] for i in selected_indexes]
 
@@ -783,6 +845,26 @@ def append_archive_message_to_history(history_index: int, sent_message: types.Me
     save_history(history)
 
 
+def append_image_message_to_history(history_index: int, image_path: Path, sent_message: types.Message):
+    history = load_history()
+    if history_index < 0 or history_index >= len(history):
+        return
+
+    entry = history[history_index]
+    image_messages = entry.get("image_messages") or []
+    image_messages.append({
+        "file_name": image_path.name,
+        "chat_id": str(sent_message.chat.id),
+        "message_id": sent_message.message_id
+    })
+    entry["image_messages"] = image_messages
+    save_history(history)
+
+
+def get_image_messages(entry: dict) -> list[dict]:
+    return entry.get("image_messages") or []
+
+
 async def send_single_archive_part(
     message: types.Message,
     zip_path: Path,
@@ -883,7 +965,7 @@ def cleanup_all_downloaded_images(state: dict):
     state["pending_cleanup"] = []
 
 
-async def send_live_downloaded_image(message: types.Message, file_path: Path, state: dict):
+async def send_live_downloaded_image(message: types.Message, file_path: Path, state: dict, history_index: Optional[int] = None):
     key = str(file_path)
     if key in state["live_sent_files"]:
         return
@@ -893,11 +975,13 @@ async def send_live_downloaded_image(message: types.Message, file_path: Path, st
 
     try:
         data = file_path.read_bytes()
-        await message.answer_photo(
+        sent_message = await message.answer_photo(
             types.BufferedInputFile(data, filename=file_path.name),
             caption=f"📸 {file_path.name}"
         )
         state["live_sent_files"].add(key)
+        if history_index is not None:
+            append_image_message_to_history(history_index, file_path, sent_message)
     except Exception as e:
         logging.error(f"Помилка живої відправки {file_path.name}: {e}")
 
@@ -915,7 +999,7 @@ async def monitor_folder_and_send_archives(folder: Path, message: types.Message,
                     continue
 
                 # 1) Одразу показуємо картинку в чаті.
-                await send_live_downloaded_image(message, file_path, state)
+                await send_live_downloaded_image(message, file_path, state, history_index)
 
                 # 2) Ту саму картинку додаємо в буфер для потокового ZIP.
                 state["pending_files"].append(file_path)
@@ -945,7 +1029,7 @@ async def flush_remaining_downloaded_images(folder: Path, message: types.Message
     for file_path in get_downloaded_images(folder):
         key = str(file_path)
         if key not in state["processed_files"]:
-            await send_live_downloaded_image(message, file_path, state)
+            await send_live_downloaded_image(message, file_path, state, history_index)
             state["pending_files"].append(file_path)
             state["processed_files"].add(key)
             state["last_image_at"] = asyncio.get_running_loop().time()
@@ -1237,6 +1321,16 @@ async def queue_worker():
             queue.task_done()
 
 
+def register_download_request(url: str) -> str:
+    token = str(len(PENDING_DOWNLOAD_REQUESTS) + 1)
+    PENDING_DOWNLOAD_REQUESTS[token] = url
+    return token
+
+
+def get_download_request(token: str) -> Optional[str]:
+    return PENDING_DOWNLOAD_REQUESTS.get(token)
+
+
 async def handle_url(message: types.Message, url: str):
     existing_index = find_done_history_entry_by_url(url)
     if existing_index is not None:
@@ -1254,7 +1348,7 @@ async def handle_url(message: types.Message, url: str):
 
     await message.answer(f"🔄 Посилання прийнято: <b>{urlparse(url).netloc}</b>")
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📸 Грабуємо 👏🏽", callback_data=f"mode:new:{url}")],
+        [InlineKeyboardButton(text="📸 Грабуємо 👏🏽", callback_data=f"mode:new:{register_download_request(url)}")],
         [InlineKeyboardButton(text="📋 Історія", callback_data="show_history")]
     ])
     await message.answer("Натисни щоб почати завантаження:", reply_markup=keyboard)
@@ -1480,6 +1574,7 @@ async def partial_resend_request(callback: types.CallbackQuery):
 
     entry = history[index]
     zip_parts = get_zip_parts(entry)
+    image_messages = get_image_messages(entry)
 
     if entry.get("status") == "interrupted" and entry.get("resume_url"):
         await callback.answer()
@@ -1490,7 +1585,15 @@ async def partial_resend_request(callback: types.CallbackQuery):
         return
 
     existing_zip_parts = [zip_path for zip_path in zip_parts if zip_path.exists()]
-    if not existing_zip_parts:
+    image_refs = []
+
+    if existing_zip_parts:
+        try:
+            image_refs = get_image_refs_from_zip_parts(existing_zip_parts)
+        except Exception as e:
+            logging.error(f"Не вдалося прочитати ZIP parts {existing_zip_parts}: {e}")
+
+    if not image_refs and not image_messages:
         await callback.answer()
         await callback.message.answer(
             "⚠️ Архів недоступний або був видалений.\n"
@@ -1499,31 +1602,25 @@ async def partial_resend_request(callback: types.CallbackQuery):
         )
         return
 
-    try:
-        image_refs = get_image_refs_from_zip_parts(existing_zip_parts)
-    except Exception as e:
-        logging.error(f"Не вдалося прочитати ZIP parts {existing_zip_parts}: {e}")
-        await callback.answer("Не вдалося відкрити архів.", show_alert=True)
-        return
-
-    if not image_refs:
-        await callback.answer("У архіві немає зображень.", show_alert=True)
-        return
-
+    image_count = len(image_refs) if image_refs else len(image_messages)
     PENDING_PARTIAL_REQUESTS[callback.from_user.id] = {
         "history_index": index,
         "zip_parts": [str(zip_path) for zip_path in existing_zip_parts],
-        "image_count": len(image_refs)
+        "image_count": image_count,
+        "prefer_telegram_history": bool(image_messages)
     }
 
-    preview_count = min(10, len(image_refs))
-    preview_lines = [f"{i + 1}. {Path(image_refs[i]['image_name']).name}" for i in range(preview_count)]
+    preview_count = min(10, image_count)
+    if image_refs:
+        preview_lines = [f"{i + 1}. {Path(image_refs[i]['image_name']).name}" for i in range(preview_count)]
+    else:
+        preview_lines = [f"{i + 1}. {image_messages[i].get('file_name', 'photo')}" for i in range(preview_count)]
     preview_text = "\n".join(preview_lines)
 
     await callback.answer()
     await callback.message.answer(
         f"🖼 <b>{entry['gallery_name']}</b>\n"
-        f"В архіві <b>{len(image_refs)}</b> фото.\n\n"
+        f"В історії <b>{image_count}</b> фото.\n\n"
         f"Надішли номери фото або діапазон.\n"
         f"Приклади: <code>1-5</code>, <code>1,3,7</code>, <code>2-4,8</code>\n\n"
         f"Перші {preview_count} фото:\n{preview_text}"
@@ -1572,7 +1669,11 @@ async def resume_download(callback: types.CallbackQuery):
 @dp.callback_query(F.data.startswith("mode:"))
 async def process_mode(callback: types.CallbackQuery):
     global queue_worker_started
-    _, action, url = callback.data.split(":", 2)
+    _, action, token = callback.data.split(":", 2)
+    url = get_download_request(token)
+    if not url:
+        await callback.answer("Посилання для цієї кнопки вже недоступне. Надішли URL ще раз.", show_alert=True)
+        return
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     download_dir = BASE_DOWNLOAD_DIR / f"{timestamp}_{urlparse(url).netloc}"
@@ -1798,8 +1899,18 @@ async def handle_partial_selection(message: types.Message):
         return
 
     try:
+        history = load_history()
+        history_index = pending.get("history_index")
+        entry = history[history_index] if history_index is not None and history_index < len(history) else {}
+        image_messages = get_image_messages(entry)
+        image_count = len(image_messages) if pending.get("prefer_telegram_history") and image_messages else pending.get("image_count", 0)
+        selected_indexes = parse_photo_selection(message.text, image_count)
+
+        if image_messages and await forward_selected_images_from_history(image_messages, selected_indexes, message):
+            return
+
         image_refs = get_image_refs_from_zip_parts(existing_zip_parts)
-        selected_indexes = parse_photo_selection(message.text, len(image_refs))
+        await send_selected_images_from_refs(image_refs, selected_indexes, message)
     except ValueError as e:
         await message.answer(
             f"⚠️ {e}\n\nСпробуй ще раз. Приклади: <code>1-5</code>, <code>1,3,7</code>, <code>2-4,8</code>"
@@ -1807,15 +1918,14 @@ async def handle_partial_selection(message: types.Message):
         return
     except Exception as e:
         logging.error(f"Помилка вибору частини фото: {e}")
-        PENDING_PARTIAL_REQUESTS.pop(message.from_user.id, None)
         await message.answer("Не вдалося прочитати архів.", reply_markup=build_main_menu())
-        return
+    finally:
+        PENDING_PARTIAL_REQUESTS.pop(message.from_user.id, None)
 
-    PENDING_PARTIAL_REQUESTS.pop(message.from_user.id, None)
-    await send_selected_images_from_refs(image_refs, selected_indexes, message)
 
 
 async def main():
+    init_history_db()
     get_download_queue()
     logging.info("🚀 Бот запущено...")
     await dp.start_polling(bot, skip_updates=True)
