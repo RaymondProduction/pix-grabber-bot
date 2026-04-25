@@ -41,6 +41,9 @@ active_downloads = 0
 
 IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp'}
 MAX_ARCHIVE_PART_SIZE = int(CONFIG.get("max_archive_part_size_mb", 45)) * 1024 * 1024
+ARCHIVE_FLUSH_RATIO = float(CONFIG.get("archive_flush_ratio", 0.90))
+ARCHIVE_FLUSH_SIZE = max(1, int(MAX_ARCHIVE_PART_SIZE * ARCHIVE_FLUSH_RATIO))
+
 
 
 def get_download_queue() -> asyncio.Queue:
@@ -441,7 +444,7 @@ async def send_archive_preview(message: types.Message, preview_image: Optional[P
             caption=(
                 f"🖼 Превʼю архіву\n"
                 f"Назва: {gallery_name}\n"
-                f"Зображень: {image_count}"
+                f"Зображень: {image_count if image_count else 'рахується...'}"
             )
         )
         preview_message = {
@@ -600,40 +603,7 @@ async def send_history(message: types.Message, page: int = 0):
         reply_markup=keyboard
     )
 
-async def monitor_folder(folder: Path, message: types.Message, sent_files: set):
-    while True:
-        await asyncio.sleep(2)
-        try:
-            files = sorted(
-                [f for f in folder.rglob("*") if f.is_file()],
-                key=lambda x: x.stat().st_mtime
-            )
-            for file_path in files:
-                if file_path.suffix.lower() not in IMAGE_EXTENSIONS:
-                    continue
-                key = str(file_path)
-                if key not in sent_files and file_path.exists():
-                    try:
-                        data = file_path.read_bytes()
-                        await message.answer_photo(
-                            types.BufferedInputFile(data, filename=file_path.name),
-                            caption=f"📸 {file_path.name}"
-                        )
-                        sent_files.add(key)
-                    except Exception as e:
-                        logging.error(f"Помилка відправки {file_path.name}: {e}")
-        except Exception as e:
-            logging.error(f"Помилка в monitor_folder: {e}")
-
-
-async def create_and_send_zip(folder: Path, message: types.Message, history_index: int):
-    images = [f for f in folder.rglob("*.*")
-              if f.is_file() and f.suffix.lower() in IMAGE_EXTENSIONS]
-
-    if not images:
-        await message.answer("Не знайдено зображень для архіву.", reply_markup=build_main_menu())
-        return
-
+def get_gallery_folder_and_names(folder: Path) -> tuple[str, str]:
     gallery_folder = None
     for p in folder.rglob("*"):
         if p.is_dir():
@@ -646,37 +616,236 @@ async def create_and_send_zip(folder: Path, message: types.Message, history_inde
 
     if gallery_folder:
         gallery_name = gallery_folder.name
-        safe_name = re.sub(r'[\\/*?:"<>|]', '_', gallery_name)[:120]
     else:
         gallery_name = folder.name
-        safe_name = re.sub(r'[\\/*?:"<>|]', '_', folder.name)[:120]
 
-    preview_image = get_first_preview_image(images)
-    zip_paths = create_archive_parts(folder, images, safe_name)
+    safe_name = re.sub(r'[\\/*?:"<>|]', '_', gallery_name)[:120]
+    return gallery_name, safe_name
+
+
+def get_downloaded_images(folder: Path) -> list[Path]:
+    return sorted(
+        [f for f in folder.rglob("*.*") if f.is_file() and f.suffix.lower() in IMAGE_EXTENSIONS],
+        key=lambda x: x.stat().st_mtime
+    )
+
+
+def build_streaming_archive_part_name(base_name: str, part_number: int) -> str:
+    return f"{base_name}.part{part_number:03d}.zip"
+
+
+def create_streaming_zip_part(folder: Path, images: list[Path], safe_name: str, part_number: int) -> Path:
+    zip_path = folder / build_streaming_archive_part_name(safe_name, part_number)
+    zip_path = make_unique_path(zip_path)
+    create_zip_file(zip_path, images)
+    return zip_path
+
+
+def append_zip_part_to_history(history_index: int, zip_path: Path):
+    history = load_history()
+    if history_index < 0 or history_index >= len(history):
+        return
+
+    entry = history[history_index]
+    zip_parts = entry.get("zip_parts") or []
+    zip_part_value = str(zip_path)
+    if zip_part_value not in zip_parts:
+        zip_parts.append(zip_part_value)
+
+    entry["zip_parts"] = zip_parts
+    if not entry.get("zip_path"):
+        entry["zip_path"] = zip_part_value
+
+    save_history(history)
+
+
+def append_archive_message_to_history(history_index: int, sent_message: types.Message):
+    history = load_history()
+    if history_index < 0 or history_index >= len(history):
+        return
+
+    entry = history[history_index]
+    archive_message = {
+        "chat_id": str(sent_message.chat.id),
+        "message_id": sent_message.message_id
+    }
+
+    archive_messages = entry.get("archive_messages") or []
+    archive_messages.append(archive_message)
+
+    entry["archive_messages"] = archive_messages
+    if not entry.get("archive_chat_id"):
+        entry["archive_chat_id"] = archive_message["chat_id"]
+    if not entry.get("archive_message_id"):
+        entry["archive_message_id"] = archive_message["message_id"]
+
+    save_history(history)
+
+
+async def send_single_archive_part(
+    message: types.Message,
+    zip_path: Path,
+    gallery_name: str,
+    part_number: int,
+    image_count: int,
+    history_index: int,
+    is_final_part: bool = False
+):
+    if part_number == 1 and is_final_part:
+        caption = (
+            f"📦 Готово!\n"
+            f"Зображень: {image_count}\n"
+            f"Назва: {gallery_name}"
+        )
+    elif is_final_part:
+        caption = (
+            f"📦 Фінальна частина {part_number}\n"
+            f"Зображень у частині: {image_count}\n"
+            f"Назва: {gallery_name}"
+        )
+    else:
+        caption = (
+            f"📦 Частина {part_number}\n"
+            f"Зображень у частині: {image_count}\n"
+            f"Назва: {gallery_name}"
+        )
+
+    data = zip_path.read_bytes()
+    sent_message = await message.answer_document(
+        types.BufferedInputFile(data, filename=zip_path.name),
+        caption=caption,
+    )
+    append_archive_message_to_history(history_index, sent_message)
+
+
+async def flush_archive_part(
+    folder: Path,
+    message: types.Message,
+    history_index: int,
+    state: dict,
+    images: list[Path],
+    is_final_part: bool = False
+):
+    if not images:
+        return
+
+    gallery_name = state.get("gallery_name")
+    safe_name = state.get("safe_name")
+    if not gallery_name or not safe_name:
+        gallery_name, safe_name = get_gallery_folder_and_names(folder)
+        state["gallery_name"] = gallery_name
+        state["safe_name"] = safe_name
+
+    if not state.get("preview_sent"):
+        preview_image = get_first_preview_image(images)
+        await send_archive_preview(message, preview_image, gallery_name, 0, history_index)
+        state["preview_sent"] = True
+
+    state["part_number"] += 1
+    part_number = state["part_number"]
+    zip_path = create_streaming_zip_part(folder, images, safe_name, part_number)
+    append_zip_part_to_history(history_index, zip_path)
+
+    state["zip_paths"].append(str(zip_path))
+    state["image_count"] += len(images)
+
+    await send_single_archive_part(
+        message=message,
+        zip_path=zip_path,
+        gallery_name=gallery_name,
+        part_number=part_number,
+        image_count=len(images),
+        history_index=history_index,
+        is_final_part=is_final_part
+    )
+
+    cleanup_images_after_zip(images)
 
     update_history_entry(
         history_index,
         gallery_name=gallery_name,
-        zip_path=str(zip_paths[0]) if zip_paths else "",
-        zip_parts=[str(zip_path) for zip_path in zip_paths],
-        image_count=len(images),
+        zip_path=state["zip_paths"][0] if state["zip_paths"] else "",
+        zip_parts=state["zip_paths"],
+        image_count=state["image_count"],
+        status="in_progress"
+    )
+
+
+async def monitor_folder_and_send_archives(folder: Path, message: types.Message, history_index: int, state: dict):
+    while True:
+        await asyncio.sleep(2)
+        try:
+            files = get_downloaded_images(folder)
+            new_images = []
+            new_size = 0
+
+            for file_path in files:
+                key = str(file_path)
+                if key in state["processed_files"]:
+                    continue
+
+                state["pending_files"].append(file_path)
+                state["processed_files"].add(key)
+                new_images.append(file_path)
+                new_size += file_path.stat().st_size
+
+            if new_images and not state.get("preview_sent"):
+                gallery_name, safe_name = get_gallery_folder_and_names(folder)
+                state["gallery_name"] = gallery_name
+                state["safe_name"] = safe_name
+                await send_archive_preview(message, get_first_preview_image(new_images), gallery_name, 0, history_index)
+                state["preview_sent"] = True
+
+            pending_size = sum(img.stat().st_size for img in state["pending_files"] if img.exists())
+            if pending_size >= ARCHIVE_FLUSH_SIZE:
+                images_to_flush = [img for img in state["pending_files"] if img.exists()]
+                state["pending_files"] = []
+                await flush_archive_part(folder, message, history_index, state, images_to_flush)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logging.error(f"Помилка в monitor_folder_and_send_archives: {e}")
+
+
+async def flush_remaining_downloaded_images(folder: Path, message: types.Message, history_index: int, state: dict):
+    # Добираємо файли, які могли зʼявитись між останнім циклом монітора і завершенням процесу.
+    for file_path in get_downloaded_images(folder):
+        key = str(file_path)
+        if key not in state["processed_files"]:
+            state["pending_files"].append(file_path)
+            state["processed_files"].add(key)
+
+    remaining_images = [img for img in state["pending_files"] if img.exists()]
+    state["pending_files"] = []
+    if remaining_images:
+        await flush_archive_part(folder, message, history_index, state, remaining_images, is_final_part=True)
+
+
+async def finalize_streaming_archives(folder: Path, message: types.Message, history_index: int, state: dict):
+    await flush_remaining_downloaded_images(folder, message, history_index, state)
+
+    if state["image_count"] == 0:
+        await message.answer("Не знайдено зображень для архіву.", reply_markup=build_main_menu())
+        return
+
+    gallery_name = state.get("gallery_name") or folder.name
+    update_history_entry(
+        history_index,
+        gallery_name=gallery_name,
+        zip_path=state["zip_paths"][0] if state["zip_paths"] else "",
+        zip_parts=state["zip_paths"],
+        image_count=state["image_count"],
         status="done",
         resume_url=""
     )
 
-    try:
-        await send_archive_preview(message, preview_image, gallery_name, len(images), history_index)
+    await message.answer(
+        f"✅ Скачування завершено.\n"
+        f"📦 Архівних частин: {len(state['zip_paths'])}\n"
+        f"🖼 Зображень: {state['image_count']}",
+        reply_markup=build_main_menu()
+    )
 
-        if len(zip_paths) > 1:
-            await message.answer(f"📦 Архів великий, тому ділю його на {len(zip_paths)} частини.")
-
-        await send_archive_parts(message, zip_paths, gallery_name, len(images), history_index)
-        cleanup_images_after_zip(images)
-        await send_start_menu(message)
-    except Exception as e:
-        logging.error(f"Помилка відправки ZIP: {e}")
-        await message.answer(f"Не вдалося відправити архів: {e}")
-        await send_start_menu(message)
 
 
 async def run_download(message: types.Message, url: str, history_index: int, download_dir: Path):
@@ -710,26 +879,52 @@ async def run_download(message: types.Message, url: str, history_index: int, dow
         stderr=asyncio.subprocess.PIPE
     )
 
-    sent_files = set()
-    monitor_task = asyncio.create_task(monitor_folder(download_dir, message, sent_files))
+    archive_state = {
+        "processed_files": set(),
+        "pending_files": [],
+        "zip_paths": [],
+        "archive_messages": [],
+        "image_count": 0,
+        "part_number": 0,
+        "preview_sent": False,
+        "gallery_name": "",
+        "safe_name": ""
+    }
+    monitor_task = asyncio.create_task(
+        monitor_folder_and_send_archives(download_dir, message, history_index, archive_state)
+    )
 
     try:
         stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=1800)
     finally:
         monitor_task.cancel()
+        try:
+            await monitor_task
+        except asyncio.CancelledError:
+            pass
 
     error_text = (stderr or b"").decode('utf-8', errors='ignore') + (stdout or b"").decode('utf-8', errors='ignore')
     resume_url = extract_resume_url(error_text)
 
     if process.returncode != 0 or resume_url:
+        await flush_remaining_downloaded_images(download_dir, message, history_index, archive_state)
         update_history_entry(
             history_index,
+            gallery_name=archive_state.get("gallery_name") or "in_progress",
+            zip_path=archive_state["zip_paths"][0] if archive_state["zip_paths"] else "",
+            zip_parts=archive_state["zip_paths"],
+            image_count=archive_state["image_count"],
             status="interrupted",
             resume_url=resume_url or "",
             download_dir=str(download_dir)
         )
 
-        await message.answer("⚠️ Скачування перервано або неповне.\nЗбережено те, що встигло.")
+        await message.answer(
+            f"⚠️ Скачування перервано або неповне.\n"
+            f"Збережено те, що встигло.\n"
+            f"📦 Архівних частин: {len(archive_state['zip_paths'])}\n"
+            f"🖼 Зображень: {archive_state['image_count']}"
+        )
 
         if resume_url:
             await message.answer(
@@ -739,7 +934,7 @@ async def run_download(message: types.Message, url: str, history_index: int, dow
         await send_start_menu(message)
         return
 
-    await create_and_send_zip(download_dir, message, history_index)
+    await finalize_streaming_archives(download_dir, message, history_index, archive_state)
 
 
 async def queue_worker():
