@@ -216,7 +216,6 @@ def find_done_history_entry_by_url(url: str) -> Optional[int]:
     return best_index
 
 def extract_resume_url(text: str) -> Optional[str]:
-    # gallery-dl пише: Use 'URL' або "URL" as input URL to continue downloading
     match = re.search(r"Use ['\"]([^'\"]+)['\"] as input URL to continue", text)
     if match:
         return match.group(1)
@@ -238,7 +237,17 @@ async def send_start_menu(message: types.Message):
 def build_main_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📋 Переглянути історію", callback_data="show_history")],
-        [InlineKeyboardButton(text="🔎 Пошук в історії", callback_data="search_history")]
+        [InlineKeyboardButton(text="🔎 Пошук в історії", callback_data="search_history")],
+        [InlineKeyboardButton(text="🛠 Службове меню", callback_data="service_menu")]
+    ])
+
+
+def build_service_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬇️ Скачати JSON з історією", callback_data="export_history_json")],
+        [InlineKeyboardButton(text="🧹 Очистити дублікати", callback_data="dedup_history")],
+        [InlineKeyboardButton(text="📦 Перенести всі архіви", callback_data="archive_all")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_start")]
     ])
 
 
@@ -387,6 +396,93 @@ def get_image_refs_from_zip_parts(zip_parts: list[Path]) -> list[dict]:
                         "image_name": name
                     })
     return image_refs
+
+
+def dedup_history() -> tuple[int, int]:
+    """Видаляє дублікати з історії.
+
+    Логіка:
+    - Якщо для URL є запис done і є in_progress/interrupted — видаляє не-done і їхні ZIP.
+    - Якщо всі done — залишає найкращий (більше archive_messages, більший index).
+    - Якщо всі не-done — залишає найновіший (максимальний index).
+
+    Повертає (видалено_записів, видалено_файлів).
+    """
+    history = load_history()
+
+    url_groups: dict[str, list[int]] = {}
+    for idx, entry in enumerate(history):
+        key = normalize_gallery_url(entry.get("url", ""))
+        url_groups.setdefault(key, []).append(idx)
+
+    indices_to_delete: set[int] = set()
+    deleted_files = 0
+
+    for _url, indices in url_groups.items():
+        if len(indices) <= 1:
+            continue
+
+        done_indices = [i for i in indices if history[i].get("status") == "done"]
+        non_done_indices = [i for i in indices if history[i].get("status") != "done"]
+
+        if done_indices:
+            to_remove = list(non_done_indices)
+
+            def _score(i: int) -> int:
+                e = history[i]
+                s = 0
+                if e.get("archive_messages") or e.get("archive_message_id"):
+                    s += 100
+                if e.get("preview_message") or e.get("preview_message_id"):
+                    s += 50
+                if e.get("zip_parts"):
+                    s += 20
+                if e.get("zip_path"):
+                    s += 10
+                s += i
+                return s
+
+            best = max(done_indices, key=_score)
+            to_remove += [i for i in done_indices if i != best]
+        else:
+            newest = max(non_done_indices)
+            to_remove = [i for i in non_done_indices if i != newest]
+
+        for i in to_remove:
+            for zip_path in get_zip_parts(history[i]):
+                try:
+                    if zip_path.exists():
+                        zip_path.unlink()
+                        deleted_files += 1
+                except Exception as e:
+                    logging.error(f"Не вдалося видалити дублікат {zip_path}: {e}")
+            indices_to_delete.add(i)
+
+    if not indices_to_delete:
+        return 0, 0
+
+    new_history = [entry for idx, entry in enumerate(history) if idx not in indices_to_delete]
+    save_history(new_history)
+    return len(indices_to_delete), deleted_files
+
+
+def archive_all_entries() -> tuple[int, int]:
+    """Переносить ZIP-файли всіх done-записів у ARCHIVE_DIR.
+    Повертає (записів оброблено, файлів переміщено).
+    """
+    history = load_history()
+    processed = 0
+    total_moved = 0
+
+    for idx, entry in enumerate(history):
+        if entry.get("status") != "done":
+            continue
+        moved_count, _ = move_entry_archives_to_archive_dir(idx)
+        if moved_count:
+            processed += 1
+            total_moved += moved_count
+
+    return processed, total_moved
 
 
 def build_archive_part_name(base_name: str, part_number: int, total_parts: int) -> str:
@@ -593,7 +689,7 @@ async def send_history(message: types.Message, page: int = 0):
     if navigation_buttons:
         buttons.append(navigation_buttons)
 
-    buttons.append([InlineKeyboardButton(text="⬇️ Скачати JSON з історією", callback_data="export_history_json")])
+    buttons.append([InlineKeyboardButton(text="🛠 Службове меню", callback_data="service_menu")])
     buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_start")])
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -840,7 +936,6 @@ async def monitor_folder_and_send_archives(folder: Path, message: types.Message,
 
 
 async def flush_remaining_downloaded_images(folder: Path, message: types.Message, history_index: int, state: dict):
-    # Добираємо файли, які могли зʼявитись між останнім циклом монітора і завершенням процесу.
     for file_path in get_downloaded_images(folder):
         key = str(file_path)
         if key not in state["processed_files"]:
@@ -1044,11 +1139,11 @@ async def history_page_callback(callback: types.CallbackQuery):
 
 
 @dp.callback_query(F.data == "export_history_json")
-async def export_history_json(callback: types.CallbackQuery):
+async def export_history_json_callback(callback: types.CallbackQuery):
     await callback.answer()
     history = load_history()
     if not history:
-        await callback.message.answer("Історія порожня.", reply_markup=build_main_menu())
+        await callback.message.answer("Історія порожня.", reply_markup=build_service_menu())
         return
 
     data = json.dumps(history, ensure_ascii=False, indent=2).encode('utf-8')
@@ -1056,8 +1151,53 @@ async def export_history_json(callback: types.CallbackQuery):
     await callback.message.answer_document(
         types.BufferedInputFile(data, filename=filename),
         caption=f"📄 Історія завантажень ({len(history)} записів)",
-        reply_markup=build_main_menu()
+        reply_markup=build_service_menu()
     )
+
+
+@dp.callback_query(F.data == "service_menu")
+async def service_menu_callback(callback: types.CallbackQuery):
+    await callback.answer()
+    await callback.message.answer(
+        "🛠 <b>Службове меню</b>",
+        reply_markup=build_service_menu()
+    )
+
+
+@dp.callback_query(F.data == "dedup_history")
+async def dedup_history_callback(callback: types.CallbackQuery):
+    await callback.answer()
+    removed, files = dedup_history()
+    if removed == 0:
+        await callback.message.answer(
+            "✅ Дублікатів не знайдено. Історія чиста.",
+            reply_markup=build_service_menu()
+        )
+    else:
+        await callback.message.answer(
+            f"🧹 Видалено дублікатів: <b>{removed}</b>\n"
+            f"Файлів видалено з диску: <b>{files}</b>",
+            reply_markup=build_service_menu()
+        )
+
+
+@dp.callback_query(F.data == "archive_all")
+async def archive_all_callback(callback: types.CallbackQuery):
+    await callback.answer()
+    processed, moved = archive_all_entries()
+    if moved == 0:
+        await callback.message.answer(
+            f"📦 Нічого переносити — або архіви вже в <code>{ARCHIVE_DIR}</code>, "
+            f"або файлів на диску немає.",
+            reply_markup=build_service_menu()
+        )
+    else:
+        await callback.message.answer(
+            f"📦 Готово!\n"
+            f"Записів оброблено: <b>{processed}</b>\n"
+            f"Файлів перенесено в <code>{ARCHIVE_DIR}</code>: <b>{moved}</b>",
+            reply_markup=build_service_menu()
+        )
 
 
 @dp.callback_query(F.data == "back_to_start")
@@ -1260,7 +1400,6 @@ async def resume_download(callback: types.CallbackQuery):
         await callback.answer("Немає даних для докачки.", show_alert=True)
         return
 
-    # Якщо download_dir з якоїсь причини відсутній — створюємо новий
     if not download_dir_value:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         download_dir_value = str(BASE_DOWNLOAD_DIR / f"{timestamp}_{urlparse(resume_url).netloc}")
@@ -1339,7 +1478,6 @@ async def send_existing_archive_from_history(message: types.Message, index: int)
 
     preview_forwarded_or_sent = False
 
-    # 1) Спочатку пробуємо показати превʼю з Telegram history.
     if preview_message:
         try:
             await bot.forward_message(
@@ -1351,8 +1489,6 @@ async def send_existing_archive_from_history(message: types.Message, index: int)
         except Exception as e:
             logging.error(f"Не вдалося переслати превʼю з Telegram history: {e}")
 
-    # 2) Якщо preview_message ще немає або він не переслався, але ZIP є на диску —
-    #    самовідновлюємо превʼю і записуємо його message_id в history.json.
     if not preview_forwarded_or_sent and existing_zip_parts:
         try:
             image_refs = get_image_refs_from_zip_parts(existing_zip_parts)
@@ -1383,8 +1519,6 @@ async def send_existing_archive_from_history(message: types.Message, index: int)
         except Exception as e:
             logging.error(f"Не вдалося відправити превʼю з ZIP: {e}")
 
-    # 3) Потім пробуємо переслати архів/частини з Telegram history.
-    #    Це має працювати навіть якщо локальні ZIP-файли вже видалені з сервера.
     forwarded_count = 0
     if archive_messages:
         try:
@@ -1405,9 +1539,6 @@ async def send_existing_archive_from_history(message: types.Message, index: int)
         except Exception as e:
             logging.error(f"Не вдалося переслати архів з Telegram history: {e}")
 
-    # 4) Якщо Telegram history не спрацювала або її ще немає — fallback на локальні ZIP-файли.
-    #    Після успішної відправки оновлюємо archive_messages, щоб наступного разу можна було
-    #    пересилати вже напряму з Telegram навіть без файлів на диску.
     if not existing_zip_parts:
         await message.answer(
             "⚠️ Архів недоступний або був видалений.\n"
