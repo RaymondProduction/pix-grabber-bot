@@ -63,6 +63,9 @@ def add_history_entry(url: str, download_dir: str) -> int:
         "archive_chat_id": "",
         "archive_message_id": "",
         "archive_messages": [],
+        "preview_chat_id": "",
+        "preview_message_id": "",
+        "preview_message": {},
         "zip_parts": []
     })
     save_history(history)
@@ -240,6 +243,45 @@ def create_zip_file(zip_path: Path, images: list[Path]):
             zf.write(img, img.name)
 
 
+def get_first_preview_image(images: list[Path]) -> Optional[Path]:
+    existing_images = [
+        img for img in images
+        if img.exists() and img.suffix.lower() in IMAGE_EXTENSIONS
+    ]
+    if not existing_images:
+        return None
+
+    return sorted(existing_images, key=lambda x: x.name.lower())[0]
+
+
+async def send_archive_preview(message: types.Message, preview_image: Optional[Path], gallery_name: str, image_count: int, history_index: int):
+    if not preview_image or not preview_image.exists():
+        return
+
+    try:
+        data = preview_image.read_bytes()
+        sent_message = await message.answer_photo(
+            types.BufferedInputFile(data, filename=preview_image.name),
+            caption=(
+                f"🖼 Превʼю архіву\n"
+                f"Назва: {gallery_name}\n"
+                f"Зображень: {image_count}"
+            )
+        )
+        preview_message = {
+            "chat_id": str(sent_message.chat.id),
+            "message_id": sent_message.message_id
+        }
+        update_history_entry(
+            history_index,
+            preview_chat_id=preview_message["chat_id"],
+            preview_message_id=preview_message["message_id"],
+            preview_message=preview_message
+        )
+    except Exception as e:
+        logging.error(f"Не вдалося відправити превʼю архіву {preview_image}: {e}")
+
+
 def create_archive_parts(folder: Path, images: list[Path], safe_name: str) -> list[Path]:
     image_parts = split_images_by_size(images, MAX_ARCHIVE_PART_SIZE)
     total_parts = len(image_parts)
@@ -415,8 +457,8 @@ async def create_and_send_zip(folder: Path, message: types.Message, history_inde
         gallery_name = folder.name
         safe_name = re.sub(r'[\\/*?:"<>|]', '_', folder.name)[:120]
 
+    preview_image = get_first_preview_image(images)
     zip_paths = create_archive_parts(folder, images, safe_name)
-    cleanup_images_after_zip(images)
 
     update_history_entry(
         history_index,
@@ -429,10 +471,13 @@ async def create_and_send_zip(folder: Path, message: types.Message, history_inde
     )
 
     try:
+        await send_archive_preview(message, preview_image, gallery_name, len(images), history_index)
+
         if len(zip_paths) > 1:
             await message.answer(f"📦 Архів великий, тому ділю його на {len(zip_paths)} частини.")
 
         await send_archive_parts(message, zip_paths, gallery_name, len(images), history_index)
+        cleanup_images_after_zip(images)
         await send_start_menu(message)
     except Exception as e:
         logging.error(f"Помилка відправки ZIP: {e}")
@@ -761,6 +806,25 @@ async def resend_zip(callback: types.CallbackQuery):
         )
         return
 
+    preview_message = entry.get("preview_message") or {}
+    if not preview_message and entry.get("preview_message_id"):
+        preview_message = {
+            "chat_id": entry.get("preview_chat_id") or callback.message.chat.id,
+            "message_id": entry.get("preview_message_id")
+        }
+
+    preview_forwarded = False
+    if preview_message:
+        try:
+            await bot.forward_message(
+                chat_id=callback.message.chat.id,
+                from_chat_id=int(preview_message.get("chat_id") or callback.message.chat.id),
+                message_id=int(preview_message["message_id"])
+            )
+            preview_forwarded = True
+        except Exception as e:
+            logging.error(f"Не вдалося переслати превʼю з Telegram history: {e}")
+
     archive_messages = entry.get("archive_messages") or []
     if not archive_messages and entry.get("archive_message_id"):
         archive_messages = [{
@@ -779,8 +843,9 @@ async def resend_zip(callback: types.CallbackQuery):
                 )
                 forwarded_count += 1
 
+            preview_text = " + превʼю" if preview_forwarded else ""
             await callback.message.answer(
-                f"✅ Архів переслано з історії Telegram. Частин: {forwarded_count}",
+                f"✅ Архів переслано з історії Telegram{preview_text}. Частин: {forwarded_count}",
                 reply_markup=build_main_menu()
             )
             return
@@ -795,6 +860,34 @@ async def resend_zip(callback: types.CallbackQuery):
             reply_markup=build_redownload_keyboard(entry["url"])
         )
         return
+
+    if not preview_forwarded:
+        try:
+            image_refs = get_image_refs_from_zip_parts(existing_zip_parts)
+            if image_refs:
+                first_ref = image_refs[0]
+                with zipfile.ZipFile(first_ref["zip_path"], 'r') as zf:
+                    preview_data = zf.read(first_ref["image_name"])
+
+                sent_preview = await callback.message.answer_photo(
+                    types.BufferedInputFile(preview_data, filename=Path(first_ref["image_name"]).name),
+                    caption=(
+                        f"🖼 Превʼю архіву\n"
+                        f"Назва: {entry['gallery_name']}\n"
+                        f"Зображень: {entry['image_count']}"
+                    )
+                )
+                update_history_entry(
+                    index,
+                    preview_chat_id=str(sent_preview.chat.id),
+                    preview_message_id=sent_preview.message_id,
+                    preview_message={
+                        "chat_id": str(sent_preview.chat.id),
+                        "message_id": sent_preview.message_id
+                    }
+                )
+        except Exception as e:
+            logging.error(f"Не вдалося відправити превʼю з ZIP: {e}")
 
     sent_messages = []
     total_parts = len(existing_zip_parts)
