@@ -34,6 +34,7 @@ HISTORY_PAGE_SIZE = 5
 
 HISTORY_FILE = Path("history.json")
 PENDING_PARTIAL_REQUESTS = {}
+PENDING_SEARCH_REQUESTS = set()
 download_queue: asyncio.Queue = asyncio.Queue()
 queue_worker_started = False
 active_downloads = 0
@@ -226,7 +227,8 @@ async def send_start_menu(message: types.Message):
 
 def build_main_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📋 Переглянути історію", callback_data="show_history")]
+        [InlineKeyboardButton(text="📋 Переглянути історію", callback_data="show_history")],
+        [InlineKeyboardButton(text="🔎 Пошук в історії", callback_data="search_history")]
     ])
 
 
@@ -262,6 +264,58 @@ def build_history_actions_keyboard(index: int, url: str) -> InlineKeyboardMarkup
         [InlineKeyboardButton(text="🗑 Видалити з історії", callback_data=f"delete_history_item:{index}")],
         [InlineKeyboardButton(text="⬅️ До історії", callback_data="show_history")]
     ])
+
+
+def search_history_entries(query: str) -> list[tuple[int, dict]]:
+    normalized_query = query.strip().lower()
+    if not normalized_query:
+        return []
+
+    history = load_history()
+    results = []
+
+    for index, entry in enumerate(history):
+        gallery_name = entry.get("gallery_name", "").lower()
+        url = entry.get("url", "").lower()
+
+        if normalized_query in gallery_name or normalized_query in url:
+            results.append((index, entry))
+
+    return list(reversed(results))
+
+
+async def send_search_results(message: types.Message, query: str):
+    results = search_history_entries(query)
+
+    if not results:
+        await message.answer(
+            f"🔎 За запитом <b>{query}</b> нічого не знайдено.",
+            reply_markup=build_main_menu()
+        )
+        return
+
+    buttons = []
+    for index, entry in results[:10]:
+        status = entry.get("status", "done")
+
+        if status == "interrupted":
+            marker = "⏸"
+        elif status == "in_progress":
+            marker = "🟡"
+        else:
+            marker = "✅"
+
+        label = f"{marker} {entry.get('gallery_name', 'Без назви')[:40]} ({entry.get('image_count', 0)} шт.) — {entry.get('date', '')}"
+        buttons.append([InlineKeyboardButton(text=label, callback_data=f"history_item:{index}")])
+
+    buttons.append([InlineKeyboardButton(text="🔎 Новий пошук", callback_data="search_history")])
+    buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_start")])
+
+    await message.answer(
+        f"🔎 Знайдено записів: <b>{len(results)}</b>\n"
+        f"Показую перші {min(10, len(results))}:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+    )
 
 
 def parse_photo_selection(text: str, max_count: int) -> list[int]:
@@ -724,6 +778,19 @@ async def show_history_callback(callback: types.CallbackQuery):
     await callback.answer()
     await send_history(callback.message, page=0)
 
+@dp.callback_query(F.data == "search_history")
+async def search_history_callback(callback: types.CallbackQuery):
+    await callback.answer()
+    PENDING_SEARCH_REQUESTS.add(callback.from_user.id)
+    PENDING_PARTIAL_REQUESTS.pop(callback.from_user.id, None)
+    await callback.message.answer(
+        "🔎 Введи частину назви або частину посилання для пошуку в історії.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Скасувати", callback_data="back_to_start")]
+        ])
+    )
+
+
 
 @dp.callback_query(F.data.startswith("history_page:"))
 async def history_page_callback(callback: types.CallbackQuery):
@@ -751,6 +818,8 @@ async def export_history_json(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data == "back_to_start")
 async def back_to_start_callback(callback: types.CallbackQuery):
+    PENDING_SEARCH_REQUESTS.discard(callback.from_user.id)
+    PENDING_PARTIAL_REQUESTS.pop(callback.from_user.id, None)
     await callback.answer()
     await callback.message.answer(
         "👋 <b>PixGrabber Bot</b>\n\n"
@@ -1141,6 +1210,16 @@ async def resend_zip(callback: types.CallbackQuery):
     await send_existing_archive_from_history(callback.message, index)
 
 
+@dp.message(Command("search"))
+async def cmd_search(message: types.Message):
+    PENDING_SEARCH_REQUESTS.add(message.from_user.id)
+    PENDING_PARTIAL_REQUESTS.pop(message.from_user.id, None)
+    await message.answer(
+        "🔎 Введи частину назви або частину посилання для пошуку в історії.",
+        reply_markup=build_main_menu()
+    )
+
+
 @dp.message(Command("history"))
 async def cmd_history(message: types.Message):
     await send_history(message)
@@ -1163,6 +1242,11 @@ async def on_link(message: types.Message):
 
 @dp.message(F.text)
 async def handle_partial_selection(message: types.Message):
+    if message.from_user.id in PENDING_SEARCH_REQUESTS:
+        PENDING_SEARCH_REQUESTS.discard(message.from_user.id)
+        await send_search_results(message, message.text.strip())
+        return
+
     pending = PENDING_PARTIAL_REQUESTS.get(message.from_user.id)
     if not pending:
         await send_start_menu(message)
