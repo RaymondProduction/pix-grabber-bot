@@ -35,12 +35,19 @@ HISTORY_PAGE_SIZE = 5
 HISTORY_FILE = Path("history.json")
 PENDING_PARTIAL_REQUESTS = {}
 PENDING_SEARCH_REQUESTS = set()
-download_queue: asyncio.Queue = asyncio.Queue()
+download_queue: Optional[asyncio.Queue] = None
 queue_worker_started = False
 active_downloads = 0
 
 IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp'}
 MAX_ARCHIVE_PART_SIZE = int(CONFIG.get("max_archive_part_size_mb", 45)) * 1024 * 1024
+
+
+def get_download_queue() -> asyncio.Queue:
+    global download_queue
+    if download_queue is None:
+        download_queue = asyncio.Queue()
+    return download_queue
 
 
 
@@ -737,17 +744,18 @@ async def run_download(message: types.Message, url: str, history_index: int, dow
 
 async def queue_worker():
     global active_downloads
+    queue = get_download_queue()
     while True:
-        message, url, history_index, download_dir = await download_queue.get()
+        message, url, history_index, download_dir = await queue.get()
         active_downloads += 1
         try:
             await run_download(message, url, history_index, download_dir)
         except Exception as e:
-            logging.error(f"Помилка в черзі для {url}: {e}")
+            logging.exception(f"Помилка в черзі для {url}: {e}")
             await send_start_menu(message)
         finally:
             active_downloads -= 1
-            download_queue.task_done()
+            queue.task_done()
 
 
 async def handle_url(message: types.Message, url: str):
@@ -1023,14 +1031,15 @@ async def resume_download(callback: types.CallbackQuery):
         update_history_entry(index, download_dir=download_dir_value)
 
     await callback.answer()
-    position = download_queue.qsize() + active_downloads
+    queue = get_download_queue()
+    position = queue.qsize() + active_downloads
     if position == 0:
         await callback.message.answer("⏩ Продовжую скачування з того самого місця...")
     else:
         await callback.message.answer(f"⏩ Докачку додано в чергу. Позиція: {position + 1}")
 
     update_history_entry(index, status="in_progress")
-    await download_queue.put((callback.message, resume_url, index, Path(download_dir_value)))
+    await queue.put((callback.message, resume_url, index, Path(download_dir_value)))
 
     if not queue_worker_started:
         queue_worker_started = True
@@ -1046,13 +1055,14 @@ async def process_mode(callback: types.CallbackQuery):
     download_dir = BASE_DOWNLOAD_DIR / f"{timestamp}_{urlparse(url).netloc}"
     history_index = add_history_entry(url, str(download_dir))
 
-    position = download_queue.qsize() + active_downloads
+    queue = get_download_queue()
+    position = queue.qsize() + active_downloads
     if position == 0:
         await callback.message.edit_text("✅ Починаю скачування...")
     else:
         await callback.message.edit_text(f"✅ Додано в чергу. Позиція: {position + 1}")
 
-    await download_queue.put((callback.message, url, history_index, download_dir))
+    await queue.put((callback.message, url, history_index, download_dir))
 
     if not queue_worker_started:
         queue_worker_started = True
@@ -1291,6 +1301,7 @@ async def handle_partial_selection(message: types.Message):
 
 
 async def main():
+    get_download_queue()
     logging.info("🚀 Бот запущено...")
     await dp.start_polling(bot, skip_updates=True)
 
