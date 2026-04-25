@@ -771,23 +771,44 @@ async def flush_archive_part(
     )
 
 
+async def send_live_downloaded_image(message: types.Message, file_path: Path, state: dict):
+    key = str(file_path)
+    if key in state["live_sent_files"]:
+        return
+
+    if not file_path.exists() or file_path.suffix.lower() not in IMAGE_EXTENSIONS:
+        return
+
+    try:
+        data = file_path.read_bytes()
+        await message.answer_photo(
+            types.BufferedInputFile(data, filename=file_path.name),
+            caption=f"📸 {file_path.name}"
+        )
+        state["live_sent_files"].add(key)
+    except Exception as e:
+        logging.error(f"Помилка живої відправки {file_path.name}: {e}")
+
+
 async def monitor_folder_and_send_archives(folder: Path, message: types.Message, history_index: int, state: dict):
     while True:
         await asyncio.sleep(2)
         try:
             files = get_downloaded_images(folder)
             new_images = []
-            new_size = 0
 
             for file_path in files:
                 key = str(file_path)
                 if key in state["processed_files"]:
                     continue
 
+                # 1) Одразу показуємо картинку в чаті.
+                await send_live_downloaded_image(message, file_path, state)
+
+                # 2) Ту саму картинку додаємо в буфер для потокового ZIP.
                 state["pending_files"].append(file_path)
                 state["processed_files"].add(key)
                 new_images.append(file_path)
-                new_size += file_path.stat().st_size
 
             if new_images and not state.get("preview_sent"):
                 gallery_name, safe_name = get_gallery_folder_and_names(folder)
@@ -812,6 +833,7 @@ async def flush_remaining_downloaded_images(folder: Path, message: types.Message
     for file_path in get_downloaded_images(folder):
         key = str(file_path)
         if key not in state["processed_files"]:
+            await send_live_downloaded_image(message, file_path, state)
             state["pending_files"].append(file_path)
             state["processed_files"].add(key)
 
@@ -881,6 +903,7 @@ async def run_download(message: types.Message, url: str, history_index: int, dow
 
     archive_state = {
         "processed_files": set(),
+        "live_sent_files": set(),
         "pending_files": [],
         "zip_paths": [],
         "archive_messages": [],
