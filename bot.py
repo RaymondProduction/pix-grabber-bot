@@ -83,6 +83,16 @@ def update_history_entry(index: int, **kwargs):
     save_history(history)
 
 
+def delete_history_entry(index: int) -> Optional[dict]:
+    history = load_history()
+    if index < 0 or index >= len(history):
+        return None
+
+    deleted_entry = history.pop(index)
+    save_history(history)
+    return deleted_entry
+
+
 def get_site_config(url: str):
     url_lower = url.lower()
     for domain, cfg in CONFIG.get("sites", {}).items():
@@ -145,6 +155,7 @@ def build_history_actions_keyboard(index: int, url: str) -> InlineKeyboardMarkup
         [InlineKeyboardButton(text="📦 Переслати архів", callback_data=f"resend:{index}")],
         [InlineKeyboardButton(text="🖼 Переслати частину фото", callback_data=f"partial:{index}")],
         [InlineKeyboardButton(text="🔗 Отримати посилання", callback_data=f"get_url:{index}")],
+        [InlineKeyboardButton(text="🗑 Видалити з історії", callback_data=f"delete_history_item:{index}")],
         [InlineKeyboardButton(text="⬅️ До історії", callback_data="show_history")]
     ])
 
@@ -659,6 +670,27 @@ async def get_url_callback(callback: types.CallbackQuery):
     await callback.answer()
     await callback.message.answer(
         f"🔗 Посилання для <b>{entry['gallery_name']}</b>:\n<a href=\"{entry['url']}\">{entry['url']}</a>",
+        reply_markup=build_main_menu()
+    )
+
+
+@dp.callback_query(F.data.startswith("delete_history_item:"))
+async def delete_history_item_callback(callback: types.CallbackQuery):
+    index = int(callback.data.split(":", 1)[1])
+    deleted_entry = delete_history_entry(index)
+
+    if not deleted_entry:
+        await callback.answer("Запис не знайдено.", show_alert=True)
+        return
+
+    pending = PENDING_PARTIAL_REQUESTS.get(callback.from_user.id)
+    if pending and pending.get("history_index") == index:
+        PENDING_PARTIAL_REQUESTS.pop(callback.from_user.id, None)
+
+    await callback.answer("Видалено з історії.")
+    await callback.message.answer(
+        f"🗑 Видалено з історії: <b>{deleted_entry.get('gallery_name', 'Без назви')}</b>\n"
+        "Файли архіву на диску не видаляв.",
         reply_markup=build_main_menu()
     )
 
