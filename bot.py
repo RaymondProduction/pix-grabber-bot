@@ -101,6 +101,30 @@ def get_image_messages(entry: dict) -> list[dict]:
     return entry.get("image_messages") or []
 
 
+def prepare_partial_request(entry: dict, index: int) -> Optional[dict]:
+    zip_parts = get_zip_parts(entry)
+    image_messages = get_image_messages(entry)
+    existing_zip_parts = [p for p in zip_parts if p.exists()]
+
+    image_refs = []
+    if existing_zip_parts:
+        try:
+            image_refs = get_image_refs_from_zip_parts(existing_zip_parts)
+        except Exception as e:
+            logging.error(f"Не вдалося прочитати ZIP parts: {e}")
+
+    if not image_refs and not image_messages:
+        return None
+
+    image_count = len(image_refs) if image_refs else len(image_messages)
+    return {
+        "history_index": index,
+        "zip_parts": [str(p) for p in existing_zip_parts],
+        "image_count": image_count,
+        "prefer_telegram_history": bool(image_messages),
+    }
+
+
 def make_unique_path(target_path: Path) -> Path:
     if not target_path.exists():
         return target_path
@@ -312,11 +336,29 @@ async def forward_selected_images_from_history(
     return True
 
 
+def find_image_messages_for_refs(image_refs: list[dict], selected_indexes: list[int], image_messages: list[dict]) -> list[dict]:
+    by_name = {im.get("file_name", ""): im for im in image_messages if im.get("file_name")}
+    selected_messages = []
+
+    for index in selected_indexes:
+        if index >= len(image_refs):
+            return []
+
+        file_name = Path(image_refs[index]["image_name"]).name
+        image_message = by_name.get(file_name)
+        if not image_message:
+            return []
+
+        selected_messages.append(image_message)
+
+    return selected_messages
+
+
 async def send_selected_images_from_refs(
-    image_refs: list[dict], selected_indexes: list[int], message: types.Message
+    image_refs: list[dict], selected_indexes: list[int], message: types.Message, history_index: Optional[int] = None
 ):
     selected_refs = [image_refs[i] for i in selected_indexes]
-    batch, sent_count, opened_zips = [], 0, {}
+    batch, batch_refs, sent_count, opened_zips = [], [], 0, {}
     try:
         for idx, ref in enumerate(selected_refs, start=1):
             zp = ref["zip_path"]
@@ -327,10 +369,15 @@ async def send_selected_images_from_refs(
                 media=types.BufferedInputFile(data, filename=Path(ref["image_name"]).name),
                 caption=f"🖼 {Path(ref['image_name']).name}" if len(batch) == 0 else None
             ))
+            batch_refs.append(ref)
             if len(batch) == 10 or idx == len(selected_refs):
-                await message.answer_media_group(batch)
+                sent_messages = await message.answer_media_group(batch)
                 sent_count += len(batch)
+                if history_index is not None:
+                    for sent_message, sent_ref in zip(sent_messages, batch_refs):
+                        append_image_message_to_history(history_index, Path(sent_ref["image_name"]), sent_message)
                 batch = []
+                batch_refs = []
     finally:
         for zf in opened_zips.values():
             zf.close()
@@ -356,7 +403,7 @@ async def send_archive_preview(
         download_id = _get_download_id(history_index)
         if download_id:
             db.set_preview_message(download_id, str(sent.chat.id), sent.message_id)
-  # Зворотна сумісність
+        # Зворотна сумісність
         db.update_history_entry(
             history_index,
             preview_chat_id=str(sent.chat.id),
@@ -365,6 +412,59 @@ async def send_archive_preview(
         )
     except Exception as e:
         logging.error(f"Не вдалося відправити превʼю: {e}")
+
+
+async def send_history_item_preview(message: types.Message, index: int, entry: dict):
+    preview_message = entry.get("preview_message") or {}
+    if not preview_message and entry.get("preview_message_id"):
+        preview_message = {
+            "chat_id": entry.get("preview_chat_id") or message.chat.id,
+            "message_id": entry.get("preview_message_id")
+        }
+
+    if preview_message:
+        try:
+            await bot.forward_message(
+                chat_id=message.chat.id,
+                from_chat_id=int(preview_message.get("chat_id") or message.chat.id),
+                message_id=int(preview_message["message_id"])
+            )
+            return
+        except Exception as e:
+            logging.error(f"Не вдалося переслати превʼю з Telegram history: {e}")
+
+    existing_zip_parts = [p for p in get_zip_parts(entry) if p.exists()]
+    if not existing_zip_parts:
+        return
+
+    try:
+        image_refs = get_image_refs_from_zip_parts(existing_zip_parts)
+        if not image_refs:
+            return
+
+        first_ref = image_refs[0]
+        with zipfile.ZipFile(first_ref["zip_path"], 'r') as zf:
+            preview_data = zf.read(first_ref["image_name"])
+
+        sent_preview = await message.answer_photo(
+            types.BufferedInputFile(preview_data, filename=Path(first_ref["image_name"]).name),
+            caption=(
+                f"🖼 Превʼю архіву\n"
+                f"Назва: {entry['gallery_name']}\n"
+                f"Зображень: {entry['image_count']}"
+            )
+        )
+        download_id = entry.get("_id")
+        if download_id:
+            db.set_preview_message(download_id, str(sent_preview.chat.id), sent_preview.message_id)
+        db.update_history_entry(
+            index,
+            preview_chat_id=str(sent_preview.chat.id),
+            preview_message_id=sent_preview.message_id,
+            preview_message={"chat_id": str(sent_preview.chat.id), "message_id": sent_preview.message_id}
+        )
+    except Exception as e:
+        logging.error(f"Не вдалося відправити превʼю з ZIP: {e}")
 
 
 def _get_download_id(history_index: int) -> Optional[int]:
@@ -1154,9 +1254,12 @@ async def history_item_callback(callback: types.CallbackQuery):
         )
         return
 
+    partial_request = prepare_partial_request(entry, index)
+
     if not any(p.exists() for p in zip_parts) \
        and not entry.get("archive_message_id") \
-       and not entry.get("archive_messages"):
+       and not entry.get("archive_messages") \
+       and not partial_request:
         await callback.message.answer(
             f"⚠️ Архів для <b>{entry['gallery_name']}</b> недоступний або видалений.\n\n"
             f"Можна спробувати скачати наново:\n{entry['url']}",
@@ -1164,11 +1267,22 @@ async def history_item_callback(callback: types.CallbackQuery):
         )
         return
 
+    await send_history_item_preview(callback.message, index, entry)
+
+    partial_text = ""
+    if partial_request:
+        PENDING_PARTIAL_REQUESTS[callback.from_user.id] = partial_request
+        partial_text = (
+            "\n\n🖼 Можеш одразу написати номери фото або діапазон.\n"
+            "Приклади: <code>1-5</code>, <code>1,3,7</code>, <code>2-4,8</code>"
+        )
+
     await callback.message.answer(
         f"📁 <b>{entry['gallery_name']}</b>\n"
         f"🖼 Зображень: {entry['image_count']}\n"
         f"📅 {entry['date']}\n"
-        f"🔗 {entry['url']}",
+        f"🔗 {entry['url']}"
+        f"{partial_text}",
         reply_markup=build_history_actions_keyboard(index, entry["url"])
     )
 
@@ -1239,8 +1353,6 @@ async def partial_resend_request(callback: types.CallbackQuery):
         return
 
     entry = history[index]
-    zip_parts = get_zip_parts(entry)
-    image_messages = get_image_messages(entry)
 
     if entry.get("status") == "interrupted" and entry.get("resume_url"):
         await callback.answer()
@@ -1250,15 +1362,8 @@ async def partial_resend_request(callback: types.CallbackQuery):
         )
         return
 
-    existing_zip_parts = [p for p in zip_parts if p.exists()]
-    image_refs = []
-    if existing_zip_parts:
-        try:
-            image_refs = get_image_refs_from_zip_parts(existing_zip_parts)
-        except Exception as e:
-            logging.error(f"Не вдалося прочитати ZIP parts: {e}")
-
-    if not image_refs and not image_messages:
+    partial_request = prepare_partial_request(entry, index)
+    if not partial_request:
         await callback.answer()
         await callback.message.answer(
             "⚠️ Архів недоступний або був видалений.\nМожна скачати його наново:",
@@ -1266,20 +1371,26 @@ async def partial_resend_request(callback: types.CallbackQuery):
         )
         return
 
-    image_count = len(image_refs) if image_refs else len(image_messages)
-    PENDING_PARTIAL_REQUESTS[callback.from_user.id] = {
-        "history_index": index,
-        "zip_parts": [str(p) for p in existing_zip_parts],
-        "image_count": image_count,
-        "prefer_telegram_history": bool(image_messages)
-    }
+    PENDING_PARTIAL_REQUESTS[callback.from_user.id] = partial_request
 
+    image_count = partial_request["image_count"]
     preview_count = min(10, image_count)
+    existing_zip_parts = [Path(p) for p in partial_request.get("zip_parts", []) if Path(p).exists()]
+    image_messages = get_image_messages(entry)
+    image_refs = []
+
+    if existing_zip_parts:
+        try:
+            image_refs = get_image_refs_from_zip_parts(existing_zip_parts)
+        except Exception as e:
+            logging.error(f"Не вдалося прочитати ZIP parts: {e}")
+
     preview_lines = (
         [f"{i + 1}. {Path(image_refs[i]['image_name']).name}" for i in range(preview_count)]
         if image_refs else
         [f"{i + 1}. {image_messages[i].get('file_name', 'photo')}" for i in range(preview_count)]
     )
+
     await callback.answer()
     await callback.message.answer(
         f"🖼 <b>{entry['gallery_name']}</b>\n"
@@ -1415,18 +1526,22 @@ async def handle_partial_selection(message: types.Message):
         return
 
     try:
-        image_count = len(image_messages) if pending.get("prefer_telegram_history") and image_messages else pending.get("image_count", 0)
+        image_count = pending.get("image_count", 0)
         selected_indexes = parse_photo_selection(message.text, image_count)
+
+        if existing_zips:
+            image_refs = get_image_refs_from_zip_parts(existing_zips)
+            selected_messages = find_image_messages_for_refs(image_refs, selected_indexes, image_messages)
+            if selected_messages and await forward_selected_images_from_history(selected_messages, list(range(len(selected_messages))), message):
+                return
+
+            await send_selected_images_from_refs(image_refs, selected_indexes, message, history_index)
+            return
 
         if image_messages and await forward_selected_images_from_history(image_messages, selected_indexes, message):
             return
 
-        if not existing_zips:
-            await message.answer("Архів більше не знайдено.", reply_markup=build_main_menu())
-            return
-
-        image_refs = get_image_refs_from_zip_parts(existing_zips)
-        await send_selected_images_from_refs(image_refs, selected_indexes, message)
+        await message.answer("Архів більше не знайдено.", reply_markup=build_main_menu())
     except ValueError as e:
         await message.answer(f"⚠️ {e}\n\nСпробуй ще раз. Приклади: <code>1-5</code>, <code>1,3,7</code>, <code>2-4,8</code>")
         return
