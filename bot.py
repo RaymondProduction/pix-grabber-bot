@@ -311,7 +311,7 @@ async def send_search_results(message: types.Message, query: str):
         if status == "interrupted":
             marker = "⏸"
         elif status == "in_progress":
-            marker = "🟡"
+        	marker = "🟡"
         else:
             marker = "✅"
 
@@ -749,6 +749,9 @@ async def flush_archive_part(
     state["zip_paths"].append(str(zip_path))
     state["image_count"] += len(images)
 
+    # Зберігаємо список файлів що треба видалити після відправки ZIP
+    state.setdefault("pending_cleanup", []).extend(images)
+
     await send_single_archive_part(
         message=message,
         zip_path=zip_path,
@@ -759,7 +762,8 @@ async def flush_archive_part(
         is_final_part=is_final_part
     )
 
-    cleanup_images_after_zip(images)
+    # НЕ видаляємо файли тут — вони ще потрібні для live-відправки в моніторі.
+    # Очищення відбувається в cleanup_all_downloaded_images після завершення.
 
     update_history_entry(
         history_index,
@@ -769,6 +773,13 @@ async def flush_archive_part(
         image_count=state["image_count"],
         status="in_progress"
     )
+
+
+def cleanup_all_downloaded_images(state: dict):
+    """Видаляє всі вихідні картинки після того як завантаження повністю завершено."""
+    images_to_delete = state.get("pending_cleanup", [])
+    cleanup_images_after_zip(images_to_delete)
+    state["pending_cleanup"] = []
 
 
 async def send_live_downloaded_image(message: types.Message, file_path: Path, state: dict):
@@ -861,6 +872,9 @@ async def finalize_streaming_archives(folder: Path, message: types.Message, hist
         resume_url=""
     )
 
+    # Тепер коли архів сформовано і відправлено — видаляємо вихідні картинки.
+    cleanup_all_downloaded_images(state)
+
     await message.answer(
         f"✅ Скачування завершено.\n"
         f"📦 Архівних частин: {len(state['zip_paths'])}\n"
@@ -905,6 +919,7 @@ async def run_download(message: types.Message, url: str, history_index: int, dow
         "processed_files": set(),
         "live_sent_files": set(),
         "pending_files": [],
+        "pending_cleanup": [],
         "zip_paths": [],
         "archive_messages": [],
         "image_count": 0,
@@ -941,6 +956,9 @@ async def run_download(message: types.Message, url: str, history_index: int, dow
             resume_url=resume_url or "",
             download_dir=str(download_dir)
         )
+
+        # При перериванні теж чистимо — архів частин вже збережено в ZIP.
+        cleanup_all_downloaded_images(archive_state)
 
         await message.answer(
             f"⚠️ Скачування перервано або неповне.\n"
