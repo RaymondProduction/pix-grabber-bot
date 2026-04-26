@@ -491,21 +491,11 @@ def create_streaming_zip_part(folder: Path, images: list[Path], safe_name: str, 
 
 
 def append_zip_part_to_history(history_index: int, zip_path: Path):
+    # Використовуємо тільки append_zip_part — він додає до існуючих частин,
+    # не перезаписує весь список. update_history_entry тут не потрібен.
     download_id = _get_download_id(history_index)
     if download_id:
         db.append_zip_part(download_id, str(zip_path))
-  # Зворотна сумісність
-    history = db.load_history()
-    if 0 <= history_index < len(history):
-        entry = history[history_index]
-        zip_parts = entry.get("zip_parts") or []
-        if str(zip_path) not in zip_parts:
-            zip_parts.append(str(zip_path))
-        db.update_history_entry(
-            history_index,
-            zip_parts=zip_parts,
-            zip_path=zip_parts[0] if zip_parts else ""
-        )
 
 
 def append_archive_message_to_history(history_index: int, sent_message: types.Message):
@@ -543,6 +533,14 @@ async def send_single_archive_part(
     append_archive_message_to_history(history_index, sent)
 
 
+def _get_existing_zip_parts_from_db(history_index: int) -> list[str]:
+    """Повертає список zip_parts що вже збережені в БД для цього запису."""
+    history = db.load_history()
+    if 0 <= history_index < len(history):
+        return history[history_index].get("zip_parts") or []
+    return []
+
+
 async def flush_archive_part(
     folder: Path, message: types.Message, history_index: int,
     state: dict, images: list[Path], is_final_part: bool = False
@@ -564,8 +562,9 @@ async def flush_archive_part(
     state["part_number"] += 1
     part_number = state["part_number"]
     zip_path = create_streaming_zip_part(folder, images, safe_name, part_number)
-    append_zip_part_to_history(history_index, zip_path)
 
+    # Додаємо нову частину через append (не перезаписуємо весь список)
+    append_zip_part_to_history(history_index, zip_path)
     state["zip_paths"].append(str(zip_path))
     state["image_count"] += len(images)
     state.setdefault("pending_cleanup", []).extend(images)
@@ -576,12 +575,11 @@ async def flush_archive_part(
         history_index=history_index, is_final_part=is_final_part
     )
 
+    # Оновлюємо тільки скалярні поля — zip_parts не чіпаємо, вони вже в БД через append
     db.update_history_entry(
         history_index,
         gallery_name=gallery_name,
-        zip_path=state["zip_paths"][0] if state["zip_paths"] else "",
-        zip_parts=state["zip_paths"],
-        image_count=state["image_count"],
+        image_count=state["image_count"] + state.get("prev_image_count", 0),
         status="in_progress"
     )
 
@@ -673,12 +671,12 @@ async def finalize_streaming_archives(
         return
 
     gallery_name = state.get("gallery_name") or folder.name
+    # Рахуємо загальну кількість зображень: поточний сеанс + попередні сеанси
+    total_image_count = state["image_count"] + state.get("prev_image_count", 0)
     db.update_history_entry(
         history_index,
         gallery_name=gallery_name,
-        zip_path=state["zip_paths"][0] if state["zip_paths"] else "",
-        zip_parts=state["zip_paths"],
-        image_count=state["image_count"],
+        image_count=total_image_count,
         status="done",
         resume_url=""
     )
@@ -686,8 +684,8 @@ async def finalize_streaming_archives(
 
     await message.answer(
         f"✅ Скачування завершено.\n"
-        f"📦 Архівних частин: {len(state['zip_paths'])}\n"
-        f"🖼 Зображень: {state['image_count']}",
+        f"📦 Архівних частин (цей сеанс): {len(state['zip_paths'])}\n"
+        f"🖼 Зображень загалом: {total_image_count}",
         reply_markup=build_main_menu()
     )
 
@@ -831,6 +829,11 @@ async def run_download(message: types.Message, url: str, history_index: int, dow
     )
 
     loop = asyncio.get_running_loop()
+
+    # Підтягуємо кількість зображень з попередніх сеансів докачки
+    prev_entry = db.load_history()
+    prev_image_count = prev_entry[history_index].get("image_count", 0) if history_index < len(prev_entry) else 0
+
     archive_state = {
         "processed_files": set(),
         "live_sent_files": set(),
@@ -839,6 +842,7 @@ async def run_download(message: types.Message, url: str, history_index: int, dow
         "zip_paths": [],
         "archive_messages":[],
         "image_count": 0,
+        "prev_image_count": prev_image_count,  # зображення з попередніх сеансів
         "part_number": 0,
         "preview_sent": False,
         "gallery_name": "",
@@ -965,12 +969,11 @@ async def run_download(message: types.Message, url: str, history_index: int, dow
 
     if interrupted:
         await flush_remaining_downloaded_images(download_dir, message, history_index, archive_state)
+        total_image_count = archive_state["image_count"] + archive_state.get("prev_image_count", 0)
         db.update_history_entry(
             history_index,
             gallery_name=archive_state.get("gallery_name") or "in_progress",
-            zip_path=archive_state["zip_paths"][0] if archive_state["zip_paths"] else "",
-            zip_parts=archive_state["zip_paths"],
-            image_count=archive_state["image_count"],
+            image_count=total_image_count,
             status="interrupted",
             resume_url=resume_url or "",
             download_dir=str(download_dir)
@@ -980,8 +983,8 @@ async def run_download(message: types.Message, url: str, history_index: int, dow
         resume_text = f"\n🔁 Resume URL: {resume_url}" if resume_url else "\n🔁 Resume URL не знайдено."
         await message.answer(
             f"⚠️ Скачування перервано або неповне.\n"
-            f"📦 Архівних частин: {len(archive_state['zip_paths'])}\n"
-            f"🖼 Зображень: {archive_state['image_count']}"
+            f"📦 Архівних частин (цей сеанс): {len(archive_state['zip_paths'])}\n"
+            f"🖼 Зображень загалом: {total_image_count}"
             f"{resume_text}"
         )
         if resume_url:
@@ -1553,7 +1556,6 @@ async def handle_partial_selection(message: types.Message):
         await message.answer("Не вдалося прочитати архів.", reply_markup=build_main_menu())
     finally:
         PENDING_PARTIAL_REQUESTS.pop(message.from_user.id, None)
-
 
 
 async def main():
