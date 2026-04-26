@@ -390,8 +390,48 @@ async def send_archive_preview(
     message: types.Message, preview_image: Optional[Path],
     gallery_name: str, image_count: int, history_index: int
 ):
+    # Якщо превʼю вже збережено в БД — не відправляємо повторно
+    history = db.load_history()
+    if 0 <= history_index < len(history):
+        existing_preview = history[history_index].get("preview_message") or {}
+        if existing_preview.get("message_id"):
+            return
+
+    # Якщо передана картинка не існує — шукаємо першу з уже збережених zip_parts
+    if (not preview_image or not preview_image.exists()) and 0 <= history_index < len(history):
+        existing_zip_parts = [p for p in get_zip_parts(history[history_index]) if p.exists()]
+        if existing_zip_parts:
+            try:
+                refs = get_image_refs_from_zip_parts(existing_zip_parts)
+                if refs:
+                    preview_image = Path(refs[0]["zip_path"]) if False else None
+                    # Читаємо безпосередньо з ZIP
+                    with zipfile.ZipFile(refs[0]["zip_path"], 'r') as zf:
+                        data = zf.read(refs[0]["image_name"])
+                    sent = await message.answer_photo(
+                        types.BufferedInputFile(data, filename=Path(refs[0]["image_name"]).name),
+                        caption=(
+                            f"🖼 Превʼю архіву\n"
+                            f"Назва: {gallery_name}\n"
+                            f"Зображень: {image_count if image_count else 'рахується...'}"
+                        )
+                    )
+                    download_id = _get_download_id(history_index)
+                    if download_id:
+                        db.set_preview_message(download_id, str(sent.chat.id), sent.message_id)
+                    db.update_history_entry(
+                        history_index,
+                        preview_chat_id=str(sent.chat.id),
+                        preview_message_id=sent.message_id,
+                        preview_message={"chat_id": str(sent.chat.id), "message_id": sent.message_id}
+                    )
+                    return
+            except Exception as e:
+                logging.error(f"Не вдалося відправити превʼю з ZIP: {e}")
+
     if not preview_image or not preview_image.exists():
         return
+
     try:
         data = preview_image.read_bytes()
         sent = await message.answer_photo(
@@ -1023,7 +1063,43 @@ def get_download_request(token: str) -> Optional[str]:
     return PENDING_DOWNLOAD_REQUESTS.get(token)
 
 
+def _find_active_history_entry_by_url(url: str) -> Optional[int]:
+    """Повертає індекс interrupted/in_progress запису для URL, якщо є."""
+    normalized = normalize_gallery_url(url)
+    history = db.load_history()
+    for i, entry in enumerate(history):
+        if normalize_gallery_url(entry.get("url", "")) != normalized:
+            continue
+        if entry.get("status") in ("interrupted", "in_progress"):
+            return i
+    return None
+
+
 async def handle_url(message: types.Message, url: str):
+    # Спочатку перевіряємо чи є незавершене завантаження
+    active_index = _find_active_history_entry_by_url(url)
+    if active_index is not None:
+        history = db.load_history()
+        entry = history[active_index]
+        status = entry.get("status")
+        if status == "interrupted" and entry.get("resume_url"):
+            await message.answer(
+                f"⏸ Це посилання вже є в історії — скачування було перерване.\n\n"
+                f"📁 <b>{entry['gallery_name']}</b>\n"
+                f"🖼 Збережено: {entry['image_count']} зображень\n"
+                f"📅 {entry['date']}\n\n"
+                f"Докачати з того самого місця?",
+                reply_markup=build_resume_keyboard(active_index)
+            )
+        else:
+            await message.answer(
+                f"🟡 Це посилання вже завантажується.\n\n"
+                f"📁 <b>{entry['gallery_name']}</b>\n"
+                f"📅 {entry['date']}",
+                reply_markup=build_main_menu()
+            )
+        return
+
     existing_index = find_done_history_entry_by_url(url)
     if existing_index is not None:
         history = db.load_history()
@@ -1253,9 +1329,46 @@ async def history_item_callback(callback: types.CallbackQuery):
     await callback.answer()
 
     if status == "interrupted" and entry.get("resume_url"):
+        partial_request = prepare_partial_request(entry, index)
+        await send_history_item_preview(callback.message, index, entry)
+        partial_text = ""
+        if partial_request:
+            PENDING_PARTIAL_REQUESTS[callback.from_user.id] = partial_request
+            partial_text = (
+                "\n\n🖼 Можеш одразу написати номери фото або діапазон.\n"
+                "Приклади: <code>1-5</code>, <code>1,3,7</code>, <code>2-4,8</code>"
+            )
         await callback.message.answer(
-            f"⏸ <b>{entry['gallery_name']}</b>\nСкачування було перерване.\nМожна докачати з того самого місця.",
+            f"⏸ <b>{entry['gallery_name']}</b>\n"
+            f"🖼 Збережено: {entry['image_count']} зображень\n"
+            f"📅 {entry['date']}\n"
+            f"🔗 {entry['url']}"
+            f"{partial_text}",
             reply_markup=build_resume_keyboard(index)
+        )
+        return
+
+    if status == "in_progress":
+        partial_request = prepare_partial_request(entry, index)
+        await send_history_item_preview(callback.message, index, entry)
+        partial_text = ""
+        if partial_request:
+            PENDING_PARTIAL_REQUESTS[callback.from_user.id] = partial_request
+            partial_text = (
+                "\n\n🖼 Можеш одразу написати номери фото або діапазон.\n"
+                "Приклади: <code>1-5</code>, <code>1,3,7</code>, <code>2-4,8</code>"
+            )
+        await callback.message.answer(
+            f"🟡 <b>{entry['gallery_name']}</b>\n"
+            f"🖼 Завантажено: {entry['image_count']} зображень\n"
+            f"📅 {entry['date']}\n"
+            f"🔗 {entry['url']}"
+            f"{partial_text}",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🖼 Переслати частину фото", callback_data=f"partial:{index}")],
+                [InlineKeyboardButton(text="🗑 Видалити з історії", callback_data=f"delete_history_item:{index}")],
+                [InlineKeyboardButton(text="⬅️ До історії", callback_data="show_history")]
+            ])
         )
         return
 
