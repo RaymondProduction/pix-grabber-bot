@@ -49,6 +49,7 @@ MAX_ARCHIVE_PART_SIZE = int(CONFIG.get("max_archive_part_size_mb", 45)) * 1024 *
 ARCHIVE_FLUSH_RATIO = float(CONFIG.get("archive_flush_ratio", 0.90))
 ARCHIVE_FLUSH_SIZE = max(1, int(MAX_ARCHIVE_PART_SIZE * ARCHIVE_FLUSH_RATIO))
 STALL_TIMEOUT = int(CONFIG.get("stall_timeout_sec", 20))
+AUTO_RESUME_DELAY = int(CONFIG.get("auto_resume_delay_min", 40)) * 60  # 0 = вимкнено
 
 
 def get_download_queue() -> asyncio.Queue:
@@ -854,10 +855,17 @@ async def run_download(message: types.Message, url: str, history_index: int, dow
         "--dest", str(download_dir),
         "--filename", "{num:0>4}.{extension}",
         "--no-part",
-        "--no-mtime"
+        "--no-mtime",
+        "--retries",      str(CONFIG.get("gallery_dl_retries", 5)),
+        "--retry-wait",   str(CONFIG.get("gallery_dl_retry_wait", 5)),
+        "--sleep",        str(CONFIG.get("gallery_dl_sleep", 1)),
+        "--sleep-request", str(CONFIG.get("gallery_dl_sleep_request", 1)),
     ]
     if username and password:
         cmd.extend(["--username", username, "--password", password])
+    cookies_browser = CONFIG.get("gallery_dl_cookies_browser", "")
+    if cookies_browser:
+        cmd.extend(["--cookies-from-browser", cookies_browser])
     if any(d in url.lower() for d in ["e-hentai.org", "exhentai.org"]):
         cookies_path = Path("cookies.txt")
         if cookies_path.exists():
@@ -1031,10 +1039,44 @@ async def run_download(message: types.Message, url: str, history_index: int, dow
         )
         if resume_url:
             await message.answer("🔄 Можна продовжити з цього місця.", reply_markup=build_resume_keyboard(history_index))
+            if AUTO_RESUME_DELAY > 0:
+                delay_min = AUTO_RESUME_DELAY // 60
+                await message.answer(
+                    f"⏳ Автоматична докачка почнеться через {delay_min} хв.\n"
+                    f"Щоб скасувати — видали запис з історії."
+                )
+                asyncio.create_task(_auto_resume(message, history_index, resume_url, download_dir))
         await send_start_menu(message)
         return
 
     await finalize_streaming_archives(download_dir, message, history_index, archive_state)
+
+
+async def _auto_resume(message: types.Message, history_index: int, resume_url: str, download_dir: Path):
+    """Автоматично докачує після затримки AUTO_RESUME_DELAY секунд."""
+    global queue_worker_started
+    await asyncio.sleep(AUTO_RESUME_DELAY)
+
+    # Перевіряємо чи запис ще існує і ще interrupted (юзер міг видалити або вже докачав вручну)
+    history = db.load_history()
+    if history_index >= len(history):
+        return
+    entry = history[history_index]
+    if entry.get("status") != "interrupted":
+        return
+    if not entry.get("resume_url"):
+        return
+
+    logging.info(f"[auto_resume] Автодокачка history_index={history_index}")
+    await message.answer("⏩ Починаю автоматичну докачку...")
+
+    db.update_history_entry(history_index, status="in_progress")
+    queue = get_download_queue()
+    await queue.put((message, resume_url, history_index, download_dir))
+
+    if not queue_worker_started:
+        queue_worker_started = True
+        asyncio.create_task(queue_worker())
 
 
 async def queue_worker():
