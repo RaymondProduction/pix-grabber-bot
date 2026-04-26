@@ -860,7 +860,6 @@ async def run_download(message: types.Message, url: str, history_index: int, dow
         "--no-part",
         "--no-mtime",
         "--retries",      str(CONFIG.get("gallery_dl_retries", 5)),
-        "--retry-wait",   str(CONFIG.get("gallery_dl_retry_wait", 5)),
         "--sleep",        str(CONFIG.get("gallery_dl_sleep", 1)),
         "--sleep-request", str(CONFIG.get("gallery_dl_sleep_request", 1)),
     ]
