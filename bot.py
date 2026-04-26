@@ -1303,21 +1303,24 @@ async def get_url_callback(callback: types.CallbackQuery):
 
 
 @dp.callback_query(F.data.startswith("delete_history_item:"))
+@dp.callback_query(F.data.startswith("delete_history_item:"))
 async def delete_history_item_callback(callback: types.CallbackQuery):
-    index = int(callback.data.split(":", 1)[1])
-    deleted_entry = db.delete_history_entry(index)
-    if not deleted_entry:
-        await callback.answer("Запис не знайдено.", show_alert=True)
-        return
-    pending = PENDING_PARTIAL_REQUESTS.get(callback.from_user.id)
-    if pending and pending.get("history_index") == index:
-        PENDING_PARTIAL_REQUESTS.pop(callback.from_user.id, None)
-    await callback.answer("Видалено з історії.")
-    await callback.message.answer(
-        f"🗑 Видалено з історії: <b>{deleted_entry.get('gallery_name', 'Без назви')}</b>\n"
-        "Файли архіву на диску не видаляв.",
-        reply_markup=build_main_menu()
-    )
+    # index = int(callback.data.split(":", 1)[1])
+    # deleted_entry = db.delete_history_entry(index)
+    # if not deleted_entry:
+    #     await callback.answer("Запис не знайдено.", show_alert=True)
+    #     return
+    # pending = PENDING_PARTIAL_REQUESTS.get(callback.from_user.id)
+    # if pending and pending.get("history_index") == index:
+    #     PENDING_PARTIAL_REQUESTS.pop(callback.from_user.id, None)
+    # await callback.answer("Видалено з історії.")
+    # await callback.message.answer(
+    #     f"🗑 Видалено з історії: <b>{deleted_entry.get('gallery_name', 'Без назви')}</b>\n"
+    #     "Файли архіву на диску не видаляв.",
+    #     reply_markup=build_main_menu()
+    # )
+
+    await callback.answer("🚫 Видалення вимкнено.", show_alert=True)
 
 
 @dp.callback_query(F.data.startswith("archive_item:"))
