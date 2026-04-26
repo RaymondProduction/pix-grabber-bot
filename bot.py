@@ -7,8 +7,9 @@ import signal
 import zipfile
 import shutil
 from typing import Optional
+from types import SimpleNamespace
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.parse import urlparse
 
 from aiogram import Bot, Dispatcher, types
@@ -721,7 +722,9 @@ async def finalize_streaming_archives(
         gallery_name=gallery_name,
         image_count=total_image_count,
         status="done",
-        resume_url=""
+        resume_url="",
+        auto_resume_at="",
+        auto_resume_chat_id=""
     )
     cleanup_all_downloaded_images(state)
 
@@ -1020,13 +1023,19 @@ async def run_download(message: types.Message, url: str, history_index: int, dow
     if interrupted:
         await flush_remaining_downloaded_images(download_dir, message, history_index, archive_state)
         total_image_count = archive_state["image_count"] + archive_state.get("prev_image_count", 0)
+        auto_resume_at = ""
+        if resume_url and AUTO_RESUME_DELAY > 0:
+            auto_resume_at = (datetime.now() + timedelta(seconds=AUTO_RESUME_DELAY)).strftime("%Y-%m-%d %H:%M:%S")
+
         db.update_history_entry(
             history_index,
             gallery_name=archive_state.get("gallery_name") or "in_progress",
             image_count=total_image_count,
             status="interrupted",
             resume_url=resume_url or "",
-            download_dir=str(download_dir)
+            download_dir=str(download_dir),
+            auto_resume_at=auto_resume_at,
+            auto_resume_chat_id=str(message.chat.id) if resume_url and AUTO_RESUME_DELAY > 0 else ""
         )
         cleanup_all_downloaded_images(archive_state)
 
@@ -1042,42 +1051,81 @@ async def run_download(message: types.Message, url: str, history_index: int, dow
             if AUTO_RESUME_DELAY > 0:
                 delay_min = AUTO_RESUME_DELAY // 60
                 await message.answer(
-                    f"⏳ Автоматична докачка почнеться через {delay_min} хв.\n"
+                    f"⏳ Автоматична докачка почнеться через {delay_min} хв, якщо інших задач не буде.\n"
                     f"Щоб скасувати — видали запис з історії."
                 )
-                asyncio.create_task(_auto_resume(message, history_index, resume_url, download_dir))
         await send_start_menu(message)
         return
 
     await finalize_streaming_archives(download_dir, message, history_index, archive_state)
 
 
-async def _auto_resume(message: types.Message, history_index: int, resume_url: str, download_dir: Path):
-    """Автоматично докачує після затримки AUTO_RESUME_DELAY секунд."""
+class ChatMessageProxy:
+    def __init__(self, chat_id: int):
+        self.chat = SimpleNamespace(id=chat_id)
+
+    async def answer(self, *args, **kwargs):
+        return await bot.send_message(self.chat.id, *args, **kwargs)
+
+    async def answer_photo(self, photo, **kwargs):
+        return await bot.send_photo(self.chat.id, photo=photo, **kwargs)
+
+    async def answer_document(self, document, **kwargs):
+        return await bot.send_document(self.chat.id, document=document, **kwargs)
+
+    async def answer_media_group(self, media, **kwargs):
+        return await bot.send_media_group(self.chat.id, media=media, **kwargs)
+
+
+async def auto_resume_worker():
     global queue_worker_started
-    await asyncio.sleep(AUTO_RESUME_DELAY)
+    while True:
+        await asyncio.sleep(30)
+        if AUTO_RESUME_DELAY <= 0:
+            continue
+        if active_downloads > 0 or not get_download_queue().empty():
+            continue
 
-    # Перевіряємо чи запис ще існує і ще interrupted (юзер міг видалити або вже докачав вручну)
-    history = db.load_history()
-    if history_index >= len(history):
-        return
-    entry = history[history_index]
-    if entry.get("status") != "interrupted":
-        return
-    if not entry.get("resume_url"):
-        return
+        history = db.load_history()
+        now = datetime.now()
 
-    logging.info(f"[auto_resume] Автодокачка history_index={history_index}")
-    await message.answer("⏩ Починаю автоматичну докачку...")
+        for index, entry in enumerate(history):
+            auto_resume_at = entry.get("auto_resume_at", "")
+            if entry.get("status") != "interrupted" or not entry.get("resume_url") or not auto_resume_at:
+                continue
 
-    db.update_history_entry(history_index, status="in_progress")
-    queue = get_download_queue()
-    await queue.put((message, resume_url, history_index, download_dir))
+            try:
+                resume_time = datetime.strptime(auto_resume_at, "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                logging.error(f"[auto_resume] Некоректний auto_resume_at для history_index={index}: {auto_resume_at}")
+                db.update_history_entry(index, auto_resume_at="")
+                continue
 
-    if not queue_worker_started:
-        queue_worker_started = True
-        asyncio.create_task(queue_worker())
+            if resume_time > now:
+                continue
 
+            chat_id = entry.get("auto_resume_chat_id", "")
+            if not chat_id:
+                logging.warning(f"[auto_resume] Немає chat_id для history_index={index}")
+                db.update_history_entry(index, auto_resume_at="")
+                continue
+
+            download_dir_value = entry.get("download_dir")
+            if not download_dir_value:
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                download_dir_value = str(BASE_DOWNLOAD_DIR / f"{timestamp}_{urlparse(entry['resume_url']).netloc}")
+
+            logging.info(f"[auto_resume] Автодокачка history_index={index}")
+            message = ChatMessageProxy(int(chat_id))
+            await message.answer("⏩ Починаю автоматичну докачку...")
+
+            db.update_history_entry(index, status="in_progress", auto_resume_at="", download_dir=download_dir_value)
+            await get_download_queue().put((message, entry["resume_url"], index, Path(download_dir_value)))
+
+            if not queue_worker_started:
+                queue_worker_started = True
+                asyncio.create_task(queue_worker())
+            break
 
 async def queue_worker():
     global active_downloads
@@ -1600,7 +1648,7 @@ async def resume_download(callback: types.CallbackQuery):
     else:
         await callback.message.answer(f"⏩ Докачку додано в чергу. Позиція: {position + 1}")
 
-    db.update_history_entry(index, status="in_progress")
+    db.update_history_entry(index, status="in_progress", auto_resume_at="", auto_resume_chat_id="")
     await queue.put((callback.message, resume_url, index, Path(download_dir_value)))
 
     if not queue_worker_started:
@@ -1743,6 +1791,7 @@ async def handle_partial_selection(message: types.Message):
 async def main():
     db.init_db()
     get_download_queue()
+    asyncio.create_task(auto_resume_worker())
     logging.info("🚀 Бот запущено...")
     await dp.start_polling(bot, skip_updates=True)
 
