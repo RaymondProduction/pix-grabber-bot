@@ -39,6 +39,7 @@ HISTORY_PAGE_SIZE = db.HISTORY_PAGE_SIZE
 PENDING_PARTIAL_REQUESTS = {}
 PENDING_SEARCH_REQUESTS = set()
 PENDING_DOWNLOAD_REQUESTS = {}
+PENDING_DELETE_REQUESTS = {}  # user_id -> history_index
 download_queue: Optional[asyncio.Queue] = None
 queue_worker_started = False
 active_downloads = 0
@@ -1306,24 +1307,30 @@ async def get_url_callback(callback: types.CallbackQuery):
 
 
 @dp.callback_query(F.data.startswith("delete_history_item:"))
-@dp.callback_query(F.data.startswith("delete_history_item:"))
 async def delete_history_item_callback(callback: types.CallbackQuery):
-    # index = int(callback.data.split(":", 1)[1])
-    # deleted_entry = db.delete_history_entry(index)
-    # if not deleted_entry:
-    #     await callback.answer("Запис не знайдено.", show_alert=True)
-    #     return
-    # pending = PENDING_PARTIAL_REQUESTS.get(callback.from_user.id)
-    # if pending and pending.get("history_index") == index:
-    #     PENDING_PARTIAL_REQUESTS.pop(callback.from_user.id, None)
-    # await callback.answer("Видалено з історії.")
-    # await callback.message.answer(
-    #     f"🗑 Видалено з історії: <b>{deleted_entry.get('gallery_name', 'Без назви')}</b>\n"
-    #     "Файли архіву на диску не видаляв.",
-    #     reply_markup=build_main_menu()
-    # )
+    index = int(callback.data.split(":", 1)[1])
+    history = db.load_history()
+    if index >= len(history):
+        await callback.answer("Запис не знайдено.", show_alert=True)
+        return
 
-    await callback.answer("🚫 Видалення вимкнено.", show_alert=True)
+    entry = history[index]
+    PENDING_DELETE_REQUESTS[callback.from_user.id] = index
+    await callback.answer()
+    await callback.message.answer(
+        f"🗑 Видалити <b>{entry.get('gallery_name', 'Без назви')}</b> з історії?\n\n"
+        f"Напиши <code>DELETE</code> великими літерами для підтвердження, або /cancel для скасування.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Скасувати", callback_data="cancel_delete")]
+        ])
+    )
+
+
+@dp.callback_query(F.data == "cancel_delete")
+async def cancel_delete_callback(callback: types.CallbackQuery):
+    PENDING_DELETE_REQUESTS.pop(callback.from_user.id, None)
+    await callback.answer("Скасовано.")
+    await callback.message.answer("Видалення скасовано.", reply_markup=build_main_menu())
 
 
 @dp.callback_query(F.data.startswith("archive_item:"))
@@ -1509,6 +1516,25 @@ async def handle_partial_selection(message: types.Message):
     if message.from_user.id in PENDING_SEARCH_REQUESTS:
         PENDING_SEARCH_REQUESTS.discard(message.from_user.id)
         await send_search_results(message, message.text.strip())
+        return
+
+    if message.from_user.id in PENDING_DELETE_REQUESTS:
+        index = PENDING_DELETE_REQUESTS.pop(message.from_user.id)
+        if message.text.strip() == "DELETE":
+            deleted_entry = db.delete_history_entry(index)
+            if not deleted_entry:
+                await message.answer("Запис не знайдено.", reply_markup=build_main_menu())
+                return
+            pending = PENDING_PARTIAL_REQUESTS.get(message.from_user.id)
+            if pending and pending.get("history_index") == index:
+                PENDING_PARTIAL_REQUESTS.pop(message.from_user.id, None)
+            await message.answer(
+                f"🗑 Видалено з історії: <b>{deleted_entry.get('gallery_name', 'Без назви')}</b>\n"
+                "Файли архіву на диску не видаляв.",
+                reply_markup=build_main_menu()
+            )
+        else:
+            await message.answer("❌ Невірне слово. Видалення скасовано.", reply_markup=build_main_menu())
         return
 
     pending = PENDING_PARTIAL_REQUESTS.get(message.from_user.id)
