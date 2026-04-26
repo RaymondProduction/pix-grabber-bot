@@ -226,6 +226,7 @@ def build_redownload_keyboard(url: str) -> InlineKeyboardMarkup:
 def build_resume_keyboard(index: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⏩ Докачати", callback_data=f"resume:{index}")],
+        [InlineKeyboardButton(text="🗑 Видалити з історії", callback_data=f"delete_history_item:{index}")],
         [InlineKeyboardButton(text="⬅️ До історії", callback_data="show_history")]
     ])
 
