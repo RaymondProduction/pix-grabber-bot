@@ -51,11 +51,49 @@ ARCHIVE_FLUSH_RATIO = float(CONFIG.get("archive_flush_ratio", 0.90))
 ARCHIVE_FLUSH_SIZE = max(1, int(MAX_ARCHIVE_PART_SIZE * ARCHIVE_FLUSH_RATIO))
 STALL_TIMEOUT = int(CONFIG.get("stall_timeout_sec", 20))
 AUTO_RESUME_ENABLED = bool(CONFIG.get("auto_resume_enabled", True))
-AUTO_RESUME_RETRY_DELAYS = [5 * 60, 15 * 60, 40 * 60, 2 * 60 * 60]
+AUTO_RESUME_RETRY_DELAYS = [5 * 60, 15 * 60, 40 * 60, 2 * 60 * 60, 4 * 60 * 60, 8 * 60 * 60]
 
 
 def get_auto_resume_delay(retry_count: int) -> int:
     return AUTO_RESUME_RETRY_DELAYS[min(max(retry_count, 1) - 1, len(AUTO_RESUME_RETRY_DELAYS) - 1)]
+
+
+def format_resume_delay(seconds: int) -> str:
+    if seconds < 3600:
+        return f"{seconds // 60} хв"
+    return f"{seconds // 3600} год"
+
+
+def get_background_resume_entries() -> tuple[list[tuple[int, dict]], list[tuple[int, dict]], list[tuple[int, dict]]]:
+    scheduled, unscheduled, no_resume = [], [], []
+    for index, entry in enumerate(db.load_history()):
+        if entry.get("status") != "interrupted":
+            continue
+        if not entry.get("resume_url"):
+            no_resume.append((index, entry))
+        elif entry.get("auto_resume_at"):
+            scheduled.append((index, entry))
+        else:
+            unscheduled.append((index, entry))
+    return scheduled, unscheduled, no_resume
+
+
+def has_background_resume_entries() -> bool:
+    scheduled, unscheduled, no_resume = get_background_resume_entries()
+    return bool(scheduled or unscheduled or no_resume)
+
+
+def schedule_background_resume(index: int, entry: dict, chat_id: int) -> Optional[str]:
+    retry_count = entry.get("retry_count") or 1
+    delay = get_auto_resume_delay(retry_count)
+    auto_resume_at = (datetime.now() + timedelta(seconds=delay)).strftime("%Y-%m-%d %H:%M:%S")
+    db.update_history_entry(
+        index,
+        auto_resume_at=auto_resume_at,
+        auto_resume_chat_id=str(chat_id),
+        retry_count=retry_count
+    )
+    return auto_resume_at
 
 
 def get_download_queue() -> asyncio.Queue:
@@ -220,12 +258,15 @@ def cleanup_download_folder(folder: Path):
 
 
 def build_main_menu() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
+    buttons = [
         [InlineKeyboardButton(text="📋 Переглянути історію", callback_data="show_history")],
         [InlineKeyboardButton(text="🖼 Переглянути історію з превʼю", callback_data="show_history_preview")],
         [InlineKeyboardButton(text="🔎 Пошук в історії", callback_data="search_history")],
-        [InlineKeyboardButton(text="🛠 Службове меню", callback_data="service_menu")]
-    ])
+    ]
+    if has_background_resume_entries():
+        buttons.append([InlineKeyboardButton(text="⏳ Фонові докачки", callback_data="background_resumes")])
+    buttons.append([InlineKeyboardButton(text="🛠 Службове меню", callback_data="service_menu")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 def build_service_menu() -> InlineKeyboardMarkup:
@@ -966,6 +1007,48 @@ async def send_history_with_preview(message: types.Message, page: int = 0):
     )
 
 
+async def send_background_resumes(message: types.Message):
+    scheduled, unscheduled, no_resume = get_background_resume_entries()
+    if not scheduled and not unscheduled and not no_resume:
+        await message.answer("⏳ Фонових докачок немає.", reply_markup=build_main_menu())
+        return
+
+    lines = ["⏳ <b>Фонові докачки</b>"]
+
+    if scheduled:
+        lines.append("\n<b>Заплановані:</b>")
+        for index, entry in scheduled[:10]:
+            lines.append(
+                f"{index + 1}. {entry.get('gallery_name', 'Без назви')[:60]} — "
+                f"{entry.get('auto_resume_at', '')}"
+            )
+
+    if unscheduled:
+        lines.append("\n<b>Не заплановані, але можна докачати:</b>")
+        for index, entry in unscheduled[:10]:
+            retry_count = entry.get("retry_count") or 1
+            delay_text = format_resume_delay(get_auto_resume_delay(retry_count))
+            lines.append(
+                f"{index + 1}. {entry.get('gallery_name', 'Без назви')[:60]} — "
+                f"буде через {delay_text}"
+            )
+
+    if no_resume:
+        lines.append("\n<b>Перервані без resume URL:</b>")
+        for index, entry in no_resume[:10]:
+            lines.append(f"{index + 1}. {entry.get('gallery_name', 'Без назви')[:60]}")
+
+    buttons = []
+    if unscheduled:
+        buttons.append([InlineKeyboardButton(text="▶️ Запланувати фонові докачки", callback_data="schedule_background_resumes")])
+    buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_start")])
+
+    await message.answer(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+    )
+
+
 async def run_download(message: types.Message, url: str, history_index: int, download_dir: Path):
     cfg = get_site_config(url)
     username = cfg.get("username")
@@ -1496,6 +1579,31 @@ async def export_history_json_callback(callback: types.CallbackQuery):
 async def service_menu_callback(callback: types.CallbackQuery):
     await callback.answer()
     await callback.message.answer("🛠 <b>Службове меню</b>", reply_markup=build_service_menu())
+
+
+@dp.callback_query(F.data == "background_resumes")
+async def background_resumes_callback(callback: types.CallbackQuery):
+    await callback.answer()
+    await send_background_resumes(callback.message)
+
+
+@dp.callback_query(F.data == "schedule_background_resumes")
+async def schedule_background_resumes_callback(callback: types.CallbackQuery):
+    scheduled, unscheduled, _ = get_background_resume_entries()
+    if not unscheduled:
+        await callback.answer("Немає незапланованих докачок.", show_alert=True)
+        return
+
+    count = 0
+    for index, entry in unscheduled:
+        schedule_background_resume(index, entry, callback.message.chat.id)
+        count += 1
+
+    await callback.answer()
+    await callback.message.answer(
+        f"✅ Заплановано фонових докачок: <b>{count}</b>.",
+        reply_markup=build_main_menu()
+    )
 
 
 @dp.callback_query(F.data == "dedup_history")
