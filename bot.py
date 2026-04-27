@@ -206,6 +206,19 @@ def cleanup_all_downloaded_images(state: dict):
     state["pending_cleanup"] = []
 
 
+def cleanup_download_folder(folder: Path):
+    try:
+        folder = folder.resolve()
+        base_dir = BASE_DOWNLOAD_DIR.resolve()
+        if folder == base_dir or base_dir not in folder.parents:
+            return
+        if folder.exists():
+            shutil.rmtree(folder, ignore_errors=True)
+            logging.info(f"[cleanup] Очищено робочу папку: {folder}")
+    except Exception as e:
+        logging.warning(f"[cleanup] Не вдалося очистити робочу папку {folder}: {e}")
+
+
 def build_main_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📋 Переглянути історію", callback_data="show_history")],
@@ -731,6 +744,7 @@ async def finalize_streaming_archives(
         retry_count=0
     )
     cleanup_all_downloaded_images(state)
+    cleanup_download_folder(folder)
 
     await message.answer(
         f"✅ Скачування завершено.\n"
