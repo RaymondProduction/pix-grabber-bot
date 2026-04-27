@@ -253,7 +253,7 @@ def build_resume_keyboard(index: int) -> InlineKeyboardMarkup:
 def build_history_actions_keyboard(index: int, url: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📦 Переслати архів", callback_data=f"resend:{index}")],
-        [InlineKeyboardButton(text="🖼 Переслати частину фото", callback_data=f"partial:{index}")],
+        [InlineKeyboardButton(text="🖼 Усі фото зі скачаного", callback_data=f"all_photos:{index}")],
         [InlineKeyboardButton(text="🔗 Отримати посилання", callback_data=f"get_url:{index}")],
         [InlineKeyboardButton(text="🗑 Видалити з історії", callback_data=f"delete_history_item:{index}")],
         [InlineKeyboardButton(text="⬅️ До історії", callback_data="show_history")]
@@ -1581,6 +1581,55 @@ async def archive_item_callback(callback: types.CallbackQuery):
         f"Перший файл: <code>{Path(moved_paths[0]).name}</code>",
         reply_markup=build_history_actions_keyboard(index, entry.get("url", ""))
     )
+
+
+@dp.callback_query(F.data.startswith("all_photos:"))
+async def all_photos_callback(callback: types.CallbackQuery):
+    index = int(callback.data.split(":", 1)[1])
+    history = db.load_history()
+    if index >= len(history):
+        await callback.answer("Запис не знайдено.", show_alert=True)
+        return
+
+    entry = history[index]
+
+    if entry.get("status") == "interrupted" and entry.get("resume_url"):
+        await callback.answer()
+        await callback.message.answer(
+            "⚠️ Це завантаження ще не завершене. Спочатку докачай його.",
+            reply_markup=build_resume_keyboard(index)
+        )
+        return
+
+    partial_request = prepare_partial_request(entry, index)
+    if not partial_request:
+        await callback.answer()
+        await callback.message.answer(
+            "⚠️ Фото недоступні. Можна скачати наново:",
+            reply_markup=build_redownload_keyboard(entry["url"])
+        )
+        return
+
+    image_count = partial_request["image_count"]
+    selected_indexes = list(range(image_count))
+    existing_zips = [Path(p) for p in partial_request.get("zip_parts", []) if Path(p).exists()]
+    image_messages = get_image_messages(entry)
+
+    await callback.answer()
+
+    if existing_zips:
+        image_refs = get_image_refs_from_zip_parts(existing_zips)
+        selected_messages = find_image_messages_for_refs(image_refs, selected_indexes, image_messages)
+        if selected_messages and await forward_selected_images_from_history(selected_messages, list(range(len(selected_messages))), callback.message):
+            return
+
+        await send_selected_images_from_refs(image_refs, selected_indexes, callback.message, index)
+        return
+
+    if image_messages and await forward_selected_images_from_history(image_messages, selected_indexes, callback.message):
+        return
+
+    await callback.message.answer("Фото більше не знайдено.", reply_markup=build_main_menu())
 
 
 @dp.callback_query(F.data.startswith("partial:"))
