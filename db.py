@@ -53,7 +53,10 @@ CREATE TABLE IF NOT EXISTS downloads (
     resume_url    TEXT    NOT NULL DEFAULT '',
     download_dir  TEXT    NOT NULL DEFAULT '',
     date          TEXT    NOT NULL,
-    archived_at   TEXT    NOT NULL DEFAULT ''
+    archived_at   TEXT    NOT NULL DEFAULT '',
+    auto_resume_at TEXT    NOT NULL DEFAULT '',
+    auto_resume_chat_id TEXT NOT NULL DEFAULT '',
+    retry_count   INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_downloads_url    ON downloads(url);
@@ -102,7 +105,7 @@ CREATE TABLE IF NOT EXISTS schema_version (
 );
 """
 
-CURRENT_SCHEMA_VERSION = 1
+CURRENT_SCHEMA_VERSION = 2
 
 
 def init_db():
@@ -128,6 +131,8 @@ def _migrate(conn: sqlite3.Connection, from_version: int):
     """Запускає всі pending-міграції по порядку."""
     if from_version < 1:
         _migrate_v0_to_v1(conn)
+    if from_version < 2:
+        _migrate_v1_to_v2(conn)
 
 
 def _migrate_v0_to_v1(conn: sqlite3.Connection):
@@ -165,6 +170,19 @@ def _migrate_v0_to_v1(conn: sqlite3.Connection):
 
     log.info(f"Міграція v0→v1: перенесено {len(old_entries)} записів")
 
+
+
+def _migrate_v1_to_v2(conn: sqlite3.Connection):
+    """Додає службові поля для автодокачки."""
+    _ensure_downloads_column(conn, "auto_resume_at", "TEXT NOT NULL DEFAULT ''")
+    _ensure_downloads_column(conn, "auto_resume_chat_id", "TEXT NOT NULL DEFAULT ''")
+    _ensure_downloads_column(conn, "retry_count", "INTEGER NOT NULL DEFAULT 0")
+
+
+def _ensure_downloads_column(conn: sqlite3.Connection, name: str, definition: str):
+    columns = [row["name"] for row in conn.execute("PRAGMA table_info(downloads)").fetchall()]
+    if name not in columns:
+        conn.execute(f"ALTER TABLE downloads ADD COLUMN {name} {definition}")
 
 def _insert_legacy_entry(conn: sqlite3.Connection, entry: dict):
     """Вставляє один legacy-запис у нормалізовані таблиці."""
@@ -278,6 +296,9 @@ def _row_to_entry(conn: sqlite3.Connection, row: sqlite3.Row) -> dict:
         "download_dir":     row["download_dir"],
         "date":             row["date"],
         "archived_at":      row["archived_at"],
+        "auto_resume_at":  row["auto_resume_at"] if "auto_resume_at" in row.keys() else "",
+        "auto_resume_chat_id": row["auto_resume_chat_id"] if "auto_resume_chat_id" in row.keys() else "",
+        "retry_count":     row["retry_count"] if "retry_count" in row.keys() else 0,
   # zip
         "zip_parts":        zip_parts,
         "zip_path":         zip_parts[0] if zip_parts else "",
@@ -339,6 +360,9 @@ def update_history_entry(index: int, **kwargs):
             "download_dir": "download_dir",
             "date":         "date",
             "archived_at":  "archived_at",
+            "auto_resume_at": "auto_resume_at",
+            "auto_resume_chat_id": "auto_resume_chat_id",
+            "retry_count": "retry_count",
         }
         scalar_updates = {
             col: kwargs[key]

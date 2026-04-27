@@ -50,7 +50,12 @@ MAX_ARCHIVE_PART_SIZE = int(CONFIG.get("max_archive_part_size_mb", 45)) * 1024 *
 ARCHIVE_FLUSH_RATIO = float(CONFIG.get("archive_flush_ratio", 0.90))
 ARCHIVE_FLUSH_SIZE = max(1, int(MAX_ARCHIVE_PART_SIZE * ARCHIVE_FLUSH_RATIO))
 STALL_TIMEOUT = int(CONFIG.get("stall_timeout_sec", 20))
-AUTO_RESUME_DELAY = int(CONFIG.get("auto_resume_delay_min", 40)) * 60  # 0 = вимкнено
+AUTO_RESUME_ENABLED = bool(CONFIG.get("auto_resume_enabled", True))
+AUTO_RESUME_RETRY_DELAYS = [5 * 60, 15 * 60, 40 * 60, 2 * 60 * 60]
+
+
+def get_auto_resume_delay(retry_count: int) -> int:
+    return AUTO_RESUME_RETRY_DELAYS[min(max(retry_count, 1) - 1, len(AUTO_RESUME_RETRY_DELAYS) - 1)]
 
 
 def get_download_queue() -> asyncio.Queue:
@@ -724,7 +729,8 @@ async def finalize_streaming_archives(
         status="done",
         resume_url="",
         auto_resume_at="",
-        auto_resume_chat_id=""
+        auto_resume_chat_id="",
+        retry_count=0
     )
     cleanup_all_downloaded_images(state)
 
@@ -1023,8 +1029,12 @@ async def run_download(message: types.Message, url: str, history_index: int, dow
         await flush_remaining_downloaded_images(download_dir, message, history_index, archive_state)
         total_image_count = archive_state["image_count"] + archive_state.get("prev_image_count", 0)
         auto_resume_at = ""
-        if resume_url and AUTO_RESUME_DELAY > 0:
-            auto_resume_at = (datetime.now() + timedelta(seconds=AUTO_RESUME_DELAY)).strftime("%Y-%m-%d %H:%M:%S")
+        retry_count = 0
+        if resume_url and AUTO_RESUME_ENABLED:
+            history = db.load_history()
+            retry_count = (history[history_index].get("retry_count") or 0) + 1 if history_index < len(history) else 1
+            delay = get_auto_resume_delay(retry_count)
+            auto_resume_at = (datetime.now() + timedelta(seconds=delay)).strftime("%Y-%m-%d %H:%M:%S")
 
         db.update_history_entry(
             history_index,
@@ -1034,7 +1044,8 @@ async def run_download(message: types.Message, url: str, history_index: int, dow
             resume_url=resume_url or "",
             download_dir=str(download_dir),
             auto_resume_at=auto_resume_at,
-            auto_resume_chat_id=str(message.chat.id) if resume_url and AUTO_RESUME_DELAY > 0 else ""
+            auto_resume_chat_id=str(message.chat.id) if resume_url and AUTO_RESUME_ENABLED else "",
+            retry_count=retry_count
         )
         cleanup_all_downloaded_images(archive_state)
 
@@ -1047,8 +1058,8 @@ async def run_download(message: types.Message, url: str, history_index: int, dow
         )
         if resume_url:
             await message.answer("🔄 Можна продовжити з цього місця.", reply_markup=build_resume_keyboard(history_index))
-            if AUTO_RESUME_DELAY > 0:
-                delay_min = AUTO_RESUME_DELAY // 60
+            if AUTO_RESUME_ENABLED:
+                delay_min = get_auto_resume_delay(retry_count) // 60
                 await message.answer(
                     f"⏳ Автоматична докачка почнеться через {delay_min} хв, якщо інших задач не буде.\n"
                     f"Щоб скасувати — видали запис з історії."
@@ -1080,7 +1091,7 @@ async def auto_resume_worker():
     global queue_worker_started
     while True:
         await asyncio.sleep(30)
-        if AUTO_RESUME_DELAY <= 0:
+        if not AUTO_RESUME_ENABLED:
             continue
         if active_downloads > 0 or not get_download_queue().empty():
             continue
