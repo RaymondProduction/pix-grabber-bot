@@ -249,6 +249,7 @@ def build_service_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⬇️ Скачати JSON з історією", callback_data="export_history_json")],
         [InlineKeyboardButton(text="🧹 Очистити дублікати", callback_data="dedup_history")],
+        [InlineKeyboardButton(text="💾 Вільне місце на диску", callback_data="disk_usage")],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_start")]
     ])
 
@@ -1545,6 +1546,31 @@ async def send_existing_archive_from_history(message: types.Message, index: int)
             archive_messages=sent_messages
         )
 
+@dp.callback_query(F.data == "disk_usage")
+async def disk_usage_callback(callback: types.CallbackQuery):
+    import shutil
+
+    try:
+        # Краще дивитись диск де архіви
+        total, used, free = shutil.disk_usage(ARCHIVE_DIR)
+    except:
+        total, used, free = shutil.disk_usage("/")
+
+    def fmt(size):
+        for unit in ["B", "KB", "MB", "GB", "TB"]:
+            if size < 1024:
+                return f"{size:.2f} {unit}"
+            size /= 1024
+
+    text = (
+        "💾 <b>Стан диску</b>\n\n"
+        f"📦 Загалом: {fmt(total)}\n"
+        f"📉 Використано: {fmt(used)}\n"
+        f"📗 Вільно: {fmt(free)}"
+    )
+
+    await callback.answer()
+    await callback.message.answer(text, reply_markup=build_service_menu())
 
 @dp.callback_query(F.data == "show_history")
 async def show_history_callback(callback: types.CallbackQuery):
