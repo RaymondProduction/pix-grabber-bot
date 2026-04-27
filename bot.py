@@ -222,6 +222,7 @@ def cleanup_download_folder(folder: Path):
 def build_main_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📋 Переглянути історію", callback_data="show_history")],
+        [InlineKeyboardButton(text="🖼 Переглянути історію з превʼю", callback_data="show_history_preview")],
         [InlineKeyboardButton(text="🔎 Пошук в історії", callback_data="search_history")],
         [InlineKeyboardButton(text="🛠 Службове меню", callback_data="service_menu")]
     ])
@@ -864,6 +865,107 @@ async def send_history(message: types.Message, page: int = 0):
     )
 
 
+async def send_history_preview_images(message: types.Message, page_items: list[tuple[int, dict]], history_len: int):
+    media = []
+    previews_to_forward = []
+
+    for i, entry in page_items:
+        real_index = history_len - 1 - i
+        existing_zip_parts = [p for p in get_zip_parts(entry) if p.exists()]
+        preview_added = False
+
+        if existing_zip_parts:
+            try:
+                refs = get_image_refs_from_zip_parts(existing_zip_parts)
+                if refs:
+                    first_ref = refs[0]
+                    with zipfile.ZipFile(first_ref["zip_path"], 'r') as zf:
+                        preview_data = zf.read(first_ref["image_name"])
+                    media.append(types.InputMediaPhoto(
+                        media=types.BufferedInputFile(preview_data, filename=Path(first_ref["image_name"]).name),
+                        caption=f"{real_index + 1}. {entry['gallery_name'][:80]}"
+                    ))
+                    preview_added = True
+            except Exception as e:
+                logging.error(f"Не вдалося підготувати превʼю для історії: {e}")
+
+        if not preview_added:
+            preview_message = entry.get("preview_message") or {}
+            if not preview_message and entry.get("preview_message_id"):
+                preview_message = {
+                    "chat_id": entry.get("preview_chat_id") or message.chat.id,
+                    "message_id": entry.get("preview_message_id")
+                }
+            if preview_message:
+                previews_to_forward.append(preview_message)
+
+    if media:
+        try:
+            await message.answer_media_group(media[:10])
+        except Exception as e:
+            logging.error(f"Не вдалося відправити превʼю історії media group: {e}")
+
+    for preview_message in previews_to_forward:
+        try:
+            await bot.forward_message(
+                chat_id=message.chat.id,
+                from_chat_id=int(preview_message.get("chat_id") or message.chat.id),
+                message_id=int(preview_message["message_id"])
+            )
+        except Exception as e:
+            logging.error(f"Не вдалося переслати превʼю історії: {e}")
+
+
+async def send_history_with_preview(message: types.Message, page: int = 0):
+    history = db.load_history()
+    if not history:
+        await message.answer("Історія порожня.", reply_markup=build_main_menu())
+        return
+
+    page = db.normalize_history_page(page, len(history))
+    page_count = db.get_history_page_count(len(history))
+    start = page * HISTORY_PAGE_SIZE
+    end = start + HISTORY_PAGE_SIZE
+    reversed_items = list(enumerate(reversed(history)))
+    page_items = reversed_items[start:end]
+
+    await send_history_preview_images(message, page_items, len(history))
+
+    buttons = []
+    for i, entry in page_items:
+        real_index = len(history) - 1 - i
+        status = entry.get("status", "done")
+        if status == "interrupted":
+            marker = "⏸"
+        elif Path(entry.get("zip_path", "")).exists() \
+             or entry.get("archive_message_id") \
+             or entry.get("archive_messages"):
+            marker = "✅"
+        elif status == "in_progress":
+            marker = "🟡"
+        else:
+            marker = "❌"
+        label = f"{marker} {entry['gallery_name'][:40]} ({entry['image_count']} шт.) — {entry['date']}"
+        buttons.append([InlineKeyboardButton(text=label, callback_data=f"history_item:{real_index}")])
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"history_preview_page:{page - 1}"))
+    if page < page_count - 1:
+        nav.append(InlineKeyboardButton(text="➡️ Далі", callback_data=f"history_preview_page:{page + 1}"))
+    if nav:
+        buttons.append(nav)
+
+    buttons.append([InlineKeyboardButton(text="📋 Історія без превʼю", callback_data="show_history")])
+    buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_start")])
+
+    await message.answer(
+        f"🖼 Історія завантажень з превʼю ({len(history)} шт.)\n"
+        f"Сторінка {page + 1}/{page_count}. Показано до {HISTORY_PAGE_SIZE} записів:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+    )
+
+
 async def run_download(message: types.Message, url: str, history_index: int, download_dir: Path):
     cfg = get_site_config(url)
     username = cfg.get("username")
@@ -1343,6 +1445,11 @@ async def show_history_callback(callback: types.CallbackQuery):
     await send_history(callback.message, page=0)
 
 
+@dp.callback_query(F.data == "show_history_preview")
+async def show_history_preview_callback(callback: types.CallbackQuery):
+    await callback.answer()
+    await send_history_with_preview(callback.message, page=0)
+
 @dp.callback_query(F.data == "search_history")
 async def search_history_callback(callback: types.CallbackQuery):
     await callback.answer()
@@ -1362,6 +1469,12 @@ async def history_page_callback(callback: types.CallbackQuery):
     await callback.answer()
     await send_history(callback.message, page=page)
 
+
+@dp.callback_query(F.data.startswith("history_preview_page:"))
+async def history_preview_page_callback(callback: types.CallbackQuery):
+    page = int(callback.data.split(":", 1)[1])
+    await callback.answer()
+    await send_history_with_preview(callback.message, page=page)
 
 @dp.callback_query(F.data == "export_history_json")
 async def export_history_json_callback(callback: types.CallbackQuery):
