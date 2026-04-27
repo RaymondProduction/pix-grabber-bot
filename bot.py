@@ -218,7 +218,6 @@ def build_service_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⬇️ Скачати JSON з історією", callback_data="export_history_json")],
         [InlineKeyboardButton(text="🧹 Очистити дублікати", callback_data="dedup_history")],
-        [InlineKeyboardButton(text="📦 Перенести всі архіви", callback_data="archive_all")],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_start")]
     ])
 
@@ -242,7 +241,6 @@ def build_history_actions_keyboard(index: int, url: str) -> InlineKeyboardMarkup
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📦 Переслати архів", callback_data=f"resend:{index}")],
         [InlineKeyboardButton(text="🖼 Переслати частину фото", callback_data=f"partial:{index}")],
-        [InlineKeyboardButton(text="📁 Архів", callback_data=f"archive_item:{index}")],
         [InlineKeyboardButton(text="🔗 Отримати посилання", callback_data=f"get_url:{index}")],
         [InlineKeyboardButton(text="🗑 Видалити з історії", callback_data=f"delete_history_item:{index}")],
         [InlineKeyboardButton(text="⬅️ До історії", callback_data="show_history")]
@@ -534,7 +532,7 @@ def build_streaming_archive_part_name(base_name: str, part_number: int) -> str:
 
 
 def create_streaming_zip_part(folder: Path, images: list[Path], safe_name: str, part_number: int) -> Path:
-    zip_path = make_unique_path(folder / build_streaming_archive_part_name(safe_name, part_number))
+    zip_path = make_unique_path(ARCHIVE_DIR / build_streaming_archive_part_name(safe_name, part_number))
     create_zip_file(zip_path, images)
     return zip_path
 
