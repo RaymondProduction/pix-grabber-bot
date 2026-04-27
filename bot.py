@@ -58,42 +58,18 @@ def get_auto_resume_delay(retry_count: int) -> int:
     return AUTO_RESUME_RETRY_DELAYS[min(max(retry_count, 1) - 1, len(AUTO_RESUME_RETRY_DELAYS) - 1)]
 
 
-def format_resume_delay(seconds: int) -> str:
+def format_auto_resume_delay(seconds: int) -> str:
     if seconds < 3600:
         return f"{seconds // 60} хв"
-    return f"{seconds // 3600} год"
+    hours = seconds // 3600
+    return f"{hours} год"
 
 
-def get_background_resume_entries() -> tuple[list[tuple[int, dict]], list[tuple[int, dict]], list[tuple[int, dict]]]:
-    scheduled, unscheduled, no_resume = [], [], []
-    for index, entry in enumerate(db.load_history()):
-        if entry.get("status") != "interrupted":
-            continue
-        if not entry.get("resume_url"):
-            no_resume.append((index, entry))
-        elif entry.get("auto_resume_at"):
-            scheduled.append((index, entry))
-        else:
-            unscheduled.append((index, entry))
-    return scheduled, unscheduled, no_resume
-
-
-def has_background_resume_entries() -> bool:
-    scheduled, unscheduled, no_resume = get_background_resume_entries()
-    return bool(scheduled or unscheduled or no_resume)
-
-
-def schedule_background_resume(index: int, entry: dict, chat_id: int) -> Optional[str]:
-    retry_count = entry.get("retry_count") or 1
-    delay = get_auto_resume_delay(retry_count)
-    auto_resume_at = (datetime.now() + timedelta(seconds=delay)).strftime("%Y-%m-%d %H:%M:%S")
-    db.update_history_entry(
-        index,
-        auto_resume_at=auto_resume_at,
-        auto_resume_chat_id=str(chat_id),
-        retry_count=retry_count
-    )
-    return auto_resume_at
+def has_background_resumes() -> bool:
+    try:
+        return any(entry.get("status") == "interrupted" for entry in db.load_history())
+    except Exception:
+        return False
 
 
 def get_download_queue() -> asyncio.Queue:
@@ -263,7 +239,7 @@ def build_main_menu() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🖼 Переглянути історію з превʼю", callback_data="show_history_preview")],
         [InlineKeyboardButton(text="🔎 Пошук в історії", callback_data="search_history")],
     ]
-    if has_background_resume_entries():
+    if has_background_resumes():
         buttons.append([InlineKeyboardButton(text="⏳ Фонові докачки", callback_data="background_resumes")])
     buttons.append([InlineKeyboardButton(text="🛠 Службове меню", callback_data="service_menu")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -1007,46 +983,94 @@ async def send_history_with_preview(message: types.Message, page: int = 0):
     )
 
 
+def get_background_resume_items() -> tuple[list[tuple[int, dict]], list[tuple[int, dict]], list[tuple[int, dict]]]:
+    scheduled = []
+    unscheduled = []
+    without_resume_url = []
+
+    for index, entry in enumerate(db.load_history()):
+        if entry.get("status") != "interrupted":
+            continue
+        if not entry.get("resume_url"):
+            without_resume_url.append((index, entry))
+            continue
+        if entry.get("auto_resume_at"):
+            scheduled.append((index, entry))
+        else:
+            unscheduled.append((index, entry))
+
+    return scheduled, unscheduled, without_resume_url
+
+
+def format_background_resume_entry(index: int, entry: dict, scheduled: bool) -> str:
+    retry_count = int(entry.get("retry_count") or 0)
+    next_retry = retry_count if scheduled else retry_count + 1
+    title = entry.get("gallery_name") or "Без назви"
+
+    if scheduled:
+        return (
+            f"• #{index + 1}: <b>{html.escape(title[:80])}</b>\n"
+            f"  Спроба автодокачки: <b>{next_retry}</b>\n"
+            f"  Запуск: <code>{entry.get('auto_resume_at')}</code>"
+        )
+
+    delay = get_auto_resume_delay(next_retry)
+    return (
+        f"• #{index + 1}: <b>{html.escape(title[:80])}</b>\n"
+        f"  Не заплановано\n"
+        f"  Наступна спроба буде: <b>{next_retry}</b> через {format_auto_resume_delay(delay)}"
+    )
+
+
 async def send_background_resumes(message: types.Message):
-    scheduled, unscheduled, no_resume = get_background_resume_entries()
-    if not scheduled and not unscheduled and not no_resume:
+    scheduled, unscheduled, without_resume_url = get_background_resume_items()
+
+    if not scheduled and not unscheduled and not without_resume_url:
         await message.answer("⏳ Фонових докачок немає.", reply_markup=build_main_menu())
         return
 
     lines = ["⏳ <b>Фонові докачки</b>"]
 
     if scheduled:
-        lines.append("\n<b>Заплановані:</b>")
+        lines.append("\n✅ <b>Заплановані:</b>")
         for index, entry in scheduled[:10]:
-            lines.append(
-                f"{index + 1}. {entry.get('gallery_name', 'Без назви')[:60]} — "
-                f"{entry.get('auto_resume_at', '')}"
-            )
+            lines.append(format_background_resume_entry(index, entry, True))
 
     if unscheduled:
-        lines.append("\n<b>Не заплановані, але можна докачати:</b>")
+        lines.append("\n⚠️ <b>Не заплановані:</b>")
         for index, entry in unscheduled[:10]:
-            retry_count = entry.get("retry_count") or 1
-            delay_text = format_resume_delay(get_auto_resume_delay(retry_count))
-            lines.append(
-                f"{index + 1}. {entry.get('gallery_name', 'Без назви')[:60]} — "
-                f"буде через {delay_text}"
-            )
+            lines.append(format_background_resume_entry(index, entry, False))
 
-    if no_resume:
-        lines.append("\n<b>Перервані без resume URL:</b>")
-        for index, entry in no_resume[:10]:
-            lines.append(f"{index + 1}. {entry.get('gallery_name', 'Без назви')[:60]}")
+    if without_resume_url:
+        lines.append("\n🚫 <b>Без resume URL:</b>")
+        for index, entry in without_resume_url[:10]:
+            title = entry.get("gallery_name") or "Без назви"
+            lines.append(f"• #{index + 1}: <b>{html.escape(title[:80])}</b>")
 
     buttons = []
     if unscheduled:
-        buttons.append([InlineKeyboardButton(text="▶️ Запланувати фонові докачки", callback_data="schedule_background_resumes")])
+        buttons.append([InlineKeyboardButton(text="⏳ Запланувати незаплановані", callback_data="schedule_background_resumes")])
+    if scheduled or unscheduled:
+        buttons.append([InlineKeyboardButton(text="▶️ Запустити наступну докачку зараз", callback_data="start_next_background_resume")])
     buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_start")])
 
-    await message.answer(
-        "\n".join(lines),
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+    await message.answer("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+
+
+def schedule_entry_for_background_resume(index: int, entry: dict, chat_id: int) -> bool:
+    if entry.get("status") != "interrupted" or not entry.get("resume_url"):
+        return False
+
+    retry_count = int(entry.get("retry_count") or 0) + 1
+    delay = get_auto_resume_delay(retry_count)
+    auto_resume_at = (datetime.now() + timedelta(seconds=delay)).strftime("%Y-%m-%d %H:%M:%S")
+    db.update_history_entry(
+        index,
+        auto_resume_at=auto_resume_at,
+        auto_resume_chat_id=str(chat_id),
+        retry_count=retry_count
     )
+    return True
 
 
 async def run_download(message: types.Message, url: str, history_index: int, download_dir: Path):
@@ -1589,21 +1613,58 @@ async def background_resumes_callback(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data == "schedule_background_resumes")
 async def schedule_background_resumes_callback(callback: types.CallbackQuery):
-    scheduled, unscheduled, _ = get_background_resume_entries()
-    if not unscheduled:
-        await callback.answer("Немає незапланованих докачок.", show_alert=True)
-        return
+    scheduled, unscheduled, _ = get_background_resume_items()
+    planned = 0
 
-    count = 0
     for index, entry in unscheduled:
-        schedule_background_resume(index, entry, callback.message.chat.id)
-        count += 1
+        if schedule_entry_for_background_resume(index, entry, callback.message.chat.id):
+            planned += 1
 
     await callback.answer()
-    await callback.message.answer(
-        f"✅ Заплановано фонових докачок: <b>{count}</b>.",
-        reply_markup=build_main_menu()
+    await callback.message.answer(f"⏳ Заплановано фонових докачок: <b>{planned}</b>.")
+    await send_background_resumes(callback.message)
+
+
+@dp.callback_query(F.data == "start_next_background_resume")
+async def start_next_background_resume_callback(callback: types.CallbackQuery):
+    global queue_worker_started
+    history = db.load_history()
+    candidates = [
+        (index, entry) for index, entry in enumerate(history)
+        if entry.get("status") == "interrupted" and entry.get("resume_url")
+    ]
+
+    if not candidates:
+        await callback.answer("Немає записів для докачки.", show_alert=True)
+        return
+
+    index, entry = candidates[0]
+    resume_url = entry.get("resume_url")
+    download_dir_value = entry.get("download_dir")
+    if not download_dir_value:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        download_dir_value = str(BASE_DOWNLOAD_DIR / f"{timestamp}_{urlparse(resume_url).netloc}")
+
+    await callback.answer()
+    queue = get_download_queue()
+    position = queue.qsize() + active_downloads
+    if position == 0:
+        await callback.message.answer("▶️ Запускаю фонову докачку зараз...")
+    else:
+        await callback.message.answer(f"▶️ Фонову докачку додано в чергу. Позиція: {position + 1}")
+
+    db.update_history_entry(
+        index,
+        status="in_progress",
+        auto_resume_at="",
+        auto_resume_chat_id=str(callback.message.chat.id),
+        download_dir=download_dir_value
     )
+    await queue.put((callback.message, resume_url, index, Path(download_dir_value)))
+
+    if not queue_worker_started:
+        queue_worker_started = True
+        asyncio.create_task(queue_worker())
 
 
 @dp.callback_query(F.data == "dedup_history")
