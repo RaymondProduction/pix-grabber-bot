@@ -92,12 +92,30 @@ def normalize_gallery_url(url: str) -> str:
     return parsed._replace(query="", fragment="").geturl().rstrip("/")
 
 
+def resolve_zip_part_path(path: Path) -> Path:
+    if path.exists():
+        return path
+
+    archive_candidate = ARCHIVE_DIR / path.name
+    if archive_candidate.exists():
+        return archive_candidate
+
+    try:
+        matches = sorted(ARCHIVE_DIR.glob(f"{path.stem}*{path.suffix}"))
+        if matches:
+            return matches[0]
+    except Exception as e:
+        logging.error(f"Не вдалося знайти архів {path.name} у {ARCHIVE_DIR}: {e}")
+
+    return path
+
+
 def get_zip_parts(entry: dict) -> list[Path]:
     zip_parts = entry.get("zip_parts") or []
     if zip_parts:
-        return [Path(p) for p in zip_parts]
+        return [resolve_zip_part_path(Path(p)) for p in zip_parts]
     if entry.get("zip_path"):
-        return [Path(entry["zip_path"])]
+        return [resolve_zip_part_path(Path(entry["zip_path"]))]
     return []
 
 
@@ -1934,8 +1952,18 @@ async def all_photos_callback(callback: types.CallbackQuery):
         await send_selected_images_from_refs(image_refs, selected_indexes, callback.message, index)
         return
 
-    if image_messages and await forward_selected_images_from_history(image_messages, selected_indexes, callback.message):
-        return
+    if image_messages:
+        expected_count = int(entry.get("image_count") or 0)
+        if expected_count and len(image_messages) < expected_count:
+            await callback.message.answer(
+                f"⚠️ У Telegram history є тільки <b>{len(image_messages)}</b> з <b>{expected_count}</b> фото.\n"
+                f"ZIP-файли для повного набору не знайдені локально.\n"
+                f"Можу переслати тільки кешовані фото або архів.",
+                reply_markup=build_history_actions_keyboard(index, entry.get("url", ""))
+            )
+            return
+        if await forward_selected_images_from_history(image_messages, selected_indexes, callback.message):
+            return
 
     await callback.message.answer("Фото більше не знайдено.", reply_markup=build_main_menu())
 
