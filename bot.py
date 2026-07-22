@@ -53,6 +53,7 @@ ARCHIVE_FLUSH_SIZE = max(1, int(MAX_ARCHIVE_PART_SIZE * ARCHIVE_FLUSH_RATIO))
 STALL_TIMEOUT = int(CONFIG.get("stall_timeout_sec", 20))
 AUTO_RESUME_ENABLED = bool(CONFIG.get("auto_resume_enabled", True))
 AUTO_RESUME_RETRY_DELAYS = [5 * 60, 15 * 60, 40 * 60, 2 * 60 * 60, 4 * 60 * 60, 8 * 60 * 60]
+AUTO_RESUME_MAX_RETRIES = int(CONFIG.get("auto_resume_max_retries", len(AUTO_RESUME_RETRY_DELAYS)))
 
 
 def get_auto_resume_delay(retry_count: int) -> int:
@@ -322,10 +323,7 @@ async def send_search_results(message: types.Message, query: str):
 
     buttons = []
     for index, entry in results[:10]:
-        status = entry.get("status", "done")
-        marker = "⏸" if status == "interrupted" else ("🟡" if status == "in_progress" else "✅")
-        label = f"{marker} {entry.get('gallery_name', 'Без назви')[:40]} ({entry.get('image_count', 0)} шт.) — {entry.get('date', '')}"
-        buttons.append([InlineKeyboardButton(text=label, callback_data=f"history_item:{index}")])
+        buttons.append([build_history_item_button(index, entry)])
 
     buttons.append([InlineKeyboardButton(text="🔎 Новий пошук", callback_data="search_history")])
     buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_start")])
@@ -865,6 +863,8 @@ def build_history_item_button(real_index: int, entry: dict) -> InlineKeyboardBut
     status = entry.get("status", "done")
     if status == "interrupted":
         marker = "⏸"
+    elif status == "failed":
+        marker = "🚫"
     elif Path(entry.get("zip_path", "")).exists() \
          or entry.get("archive_message_id") \
          or entry.get("archive_messages"):
@@ -1316,11 +1316,16 @@ async def run_download(message: types.Message, url: str, history_index: int, dow
     if interrupted:
         await flush_remaining_downloaded_images(download_dir, message, history_index, archive_state)
         total_image_count = archive_state["image_count"] + archive_state.get("prev_image_count", 0)
-        auto_resume_at = ""
+
         retry_count = 0
-        if resume_url and AUTO_RESUME_ENABLED:
+        if resume_url:
             history = db.load_history()
             retry_count = (history[history_index].get("retry_count") or 0) + 1 if history_index < len(history) else 1
+
+        gave_up = bool(resume_url) and retry_count >= AUTO_RESUME_MAX_RETRIES
+
+        auto_resume_at = ""
+        if resume_url and AUTO_RESUME_ENABLED and not gave_up:
             delay = get_auto_resume_delay(retry_count)
             auto_resume_at = (datetime.now() + timedelta(seconds=delay)).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -1328,14 +1333,26 @@ async def run_download(message: types.Message, url: str, history_index: int, dow
             history_index,
             gallery_name=archive_state.get("gallery_name") or "in_progress",
             image_count=total_image_count,
-            status="interrupted",
-            resume_url=resume_url or "",
+            status="failed" if gave_up else "interrupted",
+            resume_url="" if gave_up else (resume_url or ""),
             download_dir=str(download_dir),
             auto_resume_at=auto_resume_at,
-            auto_resume_chat_id=str(message.chat.id) if resume_url and AUTO_RESUME_ENABLED else "",
+            auto_resume_chat_id="" if gave_up else (str(message.chat.id) if resume_url and AUTO_RESUME_ENABLED else ""),
             retry_count=retry_count
         )
         cleanup_all_downloaded_images(archive_state)
+
+        if gave_up:
+            await message.answer(
+                f"🚫 Зупинив спроби докачки після {retry_count}.\n"
+                f"📁 <b>{archive_state.get('gallery_name') or 'Без назви'}</b>\n"
+                f"🖼 Збережено: {total_image_count} зображень\n\n"
+                f"Схоже, сторінка більше недоступна (можливо, контент видалили).\n"
+                f"Позначив запис як \"не вдалося завантажити\" — більше не намагатимусь автоматично.\n"
+                f"За потреби можна скачати наново з історії.",
+                reply_markup=build_main_menu()
+            )
+            return
 
         resume_text = f"\n🔁 Resume URL: {resume_url}" if resume_url else "\n🔁 Resume URL не знайдено."
         await message.answer(
