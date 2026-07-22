@@ -19,6 +19,7 @@ from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlparse
 
 log = logging.getLogger(__name__)
 
@@ -514,50 +515,45 @@ def find_download_id_by_index(index: int) -> Optional[int]:
     return _index_to_id(index)
 
 
+def _normalize_gallery_url(url: str) -> str:
+    parsed = urlparse((url or "").strip())
+    return parsed._replace(query="", fragment="").geturl().rstrip("/")
+
+
 def find_done_entry_by_url(normalized_url: str) -> Optional[int]:
     """
     Повертає порядковий індекс найкращого done-запису для URL або None.
+    URL записів у БД зберігаються в оригінальному вигляді (з query/trailing slash),
+    тому порівнюємо нормалізовані значення в Python, а не через SQL WHERE url=?.
     """
-    with get_db() as conn:
-        rows = conn.execute(
-            "SELECT id FROM downloads WHERE url=? AND status='done' ORDER BY id",
-            (normalized_url,)
-        ).fetchall()
-        if not rows:
-            return None
+    best_index = None
+    best_score = -1
 
-        best_index = None
-        best_score = -1
+    for idx, entry in enumerate(load_history()):
+        if entry.get("status") != "done":
+            continue
+        if _normalize_gallery_url(entry.get("url", "")) != normalized_url:
+            continue
 
-        all_history = load_history()
-        id_to_index = {entry["_id"]: i for i, entry in enumerate(all_history)}
+        has_zip = any(Path(p).exists() for p in entry["zip_parts"])
+        has_archive_tg = bool(entry["archive_messages"])
+        has_preview = bool(entry["preview_message"])
 
-        for row in rows:
-            did = row["id"]
-            idx = id_to_index.get(did)
-            if idx is None:
-                continue
-            entry = all_history[idx]
+        if not has_zip and not has_archive_tg:
+            continue
 
-            has_zip = any(Path(p).exists() for p in entry["zip_parts"])
-            has_archive_tg = bool(entry["archive_messages"])
-            has_preview = bool(entry["preview_message"])
+        score = 0
+        if has_archive_tg: score += 100
+        if has_preview:     score += 50
+        if entry["zip_parts"]: score += 20
+        if entry["zip_path"]:  score += 10
+        score += idx
 
-            if not has_zip and not has_archive_tg:
-                continue
+        if score > best_score:
+            best_score = score
+            best_index = idx
 
-            score = 0
-            if has_archive_tg: score += 100
-            if has_preview:     score += 50
-            if entry["zip_parts"]: score += 20
-            if entry["zip_path"]:  score += 10
-            score += idx
-
-            if score > best_score:
-                best_score = score
-                best_index = idx
-
-        return best_index
+    return best_index
 
 
 def dedup_history() -> tuple[int, int]:
