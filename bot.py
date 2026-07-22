@@ -41,6 +41,7 @@ PENDING_PARTIAL_REQUESTS = {}
 PENDING_SEARCH_REQUESTS = set()
 PENDING_DOWNLOAD_REQUESTS = {}
 PENDING_DELETE_REQUESTS = {}  # user_id -> history_index
+PENDING_HISTORY_PAGE_REQUESTS = {}  # user_id -> "plain" | "preview"
 download_queue: Optional[asyncio.Queue] = None
 queue_worker_started = False
 active_downloads = 0
@@ -853,6 +854,43 @@ async def send_start_menu(message: types.Message):
     )
 
 
+def get_history_page_items(history: list, page: int) -> list[tuple[int, dict]]:
+    start = page * HISTORY_PAGE_SIZE
+    end = start + HISTORY_PAGE_SIZE
+    reversed_items = list(enumerate(reversed(history)))
+    return reversed_items[start:end]
+
+
+def build_history_item_button(real_index: int, entry: dict) -> InlineKeyboardButton:
+    status = entry.get("status", "done")
+    if status == "interrupted":
+        marker = "⏸"
+    elif Path(entry.get("zip_path", "")).exists() \
+         or entry.get("archive_message_id") \
+         or entry.get("archive_messages"):
+        marker = "✅"
+    elif status == "in_progress":
+        marker = "🟡"
+    else:
+        marker = "❌"
+    label = f"{marker} {entry['gallery_name'][:40]} ({entry['image_count']} шт.) — {entry['date']}"
+    return InlineKeyboardButton(text=label, callback_data=f"history_item:{real_index}")
+
+
+def format_selected_pages(pages: list[int]) -> str:
+    numbers = sorted(p + 1 for p in pages)
+    ranges = []
+    start = prev = numbers[0]
+    for n in numbers[1:]:
+        if n == prev + 1:
+            prev = n
+            continue
+        ranges.append(str(start) if start == prev else f"{start}-{prev}")
+        start = prev = n
+    ranges.append(str(start) if start == prev else f"{start}-{prev}")
+    return ",".join(ranges)
+
+
 async def send_history(message: types.Message, page: int = 0):
     history = db.load_history()
     if not history:
@@ -861,27 +899,12 @@ async def send_history(message: types.Message, page: int = 0):
 
     page = db.normalize_history_page(page, len(history))
     page_count = db.get_history_page_count(len(history))
-    start = page * HISTORY_PAGE_SIZE
-    end = start + HISTORY_PAGE_SIZE
-    reversed_items = list(enumerate(reversed(history)))
-    page_items = reversed_items[start:end]
+    page_items = get_history_page_items(history, page)
 
     buttons = []
     for i, entry in page_items:
         real_index = len(history) - 1 - i
-        status = entry.get("status", "done")
-        if status == "interrupted":
-            marker = "⏸"
-        elif Path(entry.get("zip_path", "")).exists() \
-             or entry.get("archive_message_id") \
-             or entry.get("archive_messages"):
-            marker = "✅"
-        elif status == "in_progress":
-            marker = "🟡"
-        else:
-            marker = "❌"
-        label = f"{marker} {entry['gallery_name'][:40]} ({entry['image_count']} шт.) — {entry['date']}"
-        buttons.append([InlineKeyboardButton(text=label, callback_data=f"history_item:{real_index}")])
+        buttons.append([build_history_item_button(real_index, entry)])
 
     nav = []
     if page > 0:
@@ -891,6 +914,8 @@ async def send_history(message: types.Message, page: int = 0):
     if nav:
         buttons.append(nav)
 
+    if page_count > 1:
+        buttons.append([InlineKeyboardButton(text="🔢 Обрати сторінки", callback_data="select_history_pages:plain")])
     buttons.append([InlineKeyboardButton(text="🛠 Службове меню", callback_data="service_menu")])
     buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_start")])
 
@@ -935,9 +960,9 @@ async def send_history_preview_images(message: types.Message, page_items: list[t
             if preview_message:
                 previews_to_forward.append(preview_message)
 
-    if media:
+    for chunk_start in range(0, len(media), 10):
         try:
-            await message.answer_media_group(media[:10])
+            await message.answer_media_group(media[chunk_start:chunk_start + 10])
         except Exception as e:
             logging.error(f"Не вдалося відправити превʼю історії media group: {e}")
 
@@ -960,29 +985,14 @@ async def send_history_with_preview(message: types.Message, page: int = 0):
 
     page = db.normalize_history_page(page, len(history))
     page_count = db.get_history_page_count(len(history))
-    start = page * HISTORY_PAGE_SIZE
-    end = start + HISTORY_PAGE_SIZE
-    reversed_items = list(enumerate(reversed(history)))
-    page_items = reversed_items[start:end]
+    page_items = get_history_page_items(history, page)
 
     await send_history_preview_images(message, page_items, len(history))
 
     buttons = []
     for i, entry in page_items:
         real_index = len(history) - 1 - i
-        status = entry.get("status", "done")
-        if status == "interrupted":
-            marker = "⏸"
-        elif Path(entry.get("zip_path", "")).exists() \
-             or entry.get("archive_message_id") \
-             or entry.get("archive_messages"):
-            marker = "✅"
-        elif status == "in_progress":
-            marker = "🟡"
-        else:
-            marker = "❌"
-        label = f"{marker} {entry['gallery_name'][:40]} ({entry['image_count']} шт.) — {entry['date']}"
-        buttons.append([InlineKeyboardButton(text=label, callback_data=f"history_item:{real_index}")])
+        buttons.append([build_history_item_button(real_index, entry)])
 
     nav = []
     if page > 0:
@@ -992,12 +1002,50 @@ async def send_history_with_preview(message: types.Message, page: int = 0):
     if nav:
         buttons.append(nav)
 
+    if page_count > 1:
+        buttons.append([InlineKeyboardButton(text="🔢 Обрати сторінки", callback_data="select_history_pages:preview")])
     buttons.append([InlineKeyboardButton(text="📋 Історія без превʼю", callback_data="show_history")])
     buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_start")])
 
     await message.answer(
         f"🖼 Історія завантажень з превʼю ({len(history)} шт.)\n"
         f"Сторінка {page + 1}/{page_count}. Показано до {HISTORY_PAGE_SIZE} записів:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+    )
+
+
+async def send_history_selected_pages(message: types.Message, pages: list[int], preview: bool):
+    history = db.load_history()
+    if not history:
+        await message.answer("Історія порожня.", reply_markup=build_main_menu())
+        return
+
+    combined_items = []
+    for page in pages:
+        combined_items.extend(get_history_page_items(history, page))
+
+    if not combined_items:
+        await message.answer("На обраних сторінках немає записів.", reply_markup=build_main_menu())
+        return
+
+    if preview:
+        await send_history_preview_images(message, combined_items, len(history))
+
+    buttons = []
+    for i, entry in combined_items:
+        real_index = len(history) - 1 - i
+        buttons.append([build_history_item_button(real_index, entry)])
+
+    buttons.append([InlineKeyboardButton(
+        text="📋 Уся історія", callback_data="show_history_preview" if preview else "show_history"
+    )])
+    buttons.append([InlineKeyboardButton(text="🛠 Службове меню", callback_data="service_menu")])
+    buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_start")])
+
+    title = "🖼 Історія завантажень з превʼю" if preview else "📋 Історія завантажень"
+    await message.answer(
+        f"{title}\n"
+        f"Сторінки: {format_selected_pages(pages)} ({len(combined_items)} шт.):",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
     )
 
@@ -1627,6 +1675,23 @@ async def history_preview_page_callback(callback: types.CallbackQuery):
     await callback.answer()
     await send_history_with_preview(callback.message, page=page)
 
+
+@dp.callback_query(F.data.startswith("select_history_pages:"))
+async def select_history_pages_callback(callback: types.CallbackQuery):
+    mode = callback.data.split(":", 1)[1]
+    history = db.load_history()
+    page_count = db.get_history_page_count(len(history))
+    await callback.answer()
+    PENDING_HISTORY_PAGE_REQUESTS[callback.from_user.id] = mode
+    await callback.message.answer(
+        f"🔢 Надішли номери сторінок або діапазон (усього сторінок: {page_count}).\n"
+        f"Приклади: <code>1-3</code>, <code>1,3,5</code>, <code>2-4,8</code>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Скасувати", callback_data="back_to_start")]
+        ])
+    )
+
+
 @dp.callback_query(F.data == "export_history_json")
 async def export_history_json_callback(callback: types.CallbackQuery):
     await callback.answer()
@@ -1744,6 +1809,7 @@ async def archive_all_callback(callback: types.CallbackQuery):
 async def back_to_start_callback(callback: types.CallbackQuery):
     PENDING_SEARCH_REQUESTS.discard(callback.from_user.id)
     PENDING_PARTIAL_REQUESTS.pop(callback.from_user.id, None)
+    PENDING_HISTORY_PAGE_REQUESTS.pop(callback.from_user.id, None)
     await callback.answer()
     await callback.message.answer(
         "👋 <b>PixGrabber Bot</b>\n\nНадішли посилання — для завантаження.",
@@ -2127,6 +2193,19 @@ async def handle_partial_selection(message: types.Message):
     if message.from_user.id in PENDING_SEARCH_REQUESTS:
         PENDING_SEARCH_REQUESTS.discard(message.from_user.id)
         await send_search_results(message, message.text.strip())
+        return
+
+    if message.from_user.id in PENDING_HISTORY_PAGE_REQUESTS:
+        mode = PENDING_HISTORY_PAGE_REQUESTS.pop(message.from_user.id)
+        history = db.load_history()
+        page_count = db.get_history_page_count(len(history))
+        try:
+            pages = parse_photo_selection(message.text, page_count)
+        except ValueError as e:
+            await message.answer(f"⚠️ {e}\n\nСпробуй ще раз. Приклади: <code>1-3</code>, <code>1,3,5</code>")
+            PENDING_HISTORY_PAGE_REQUESTS[message.from_user.id] = mode
+            return
+        await send_history_selected_pages(message, pages, preview=(mode == "preview"))
         return
 
     if message.from_user.id in PENDING_DELETE_REQUESTS:
