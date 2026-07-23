@@ -26,7 +26,7 @@ fi
 echo "Activating venv and updating packages..."
 source venv/bin/activate
 pip install --upgrade pip
-pip install --upgrade aiogram gallery-dl
+pip install --upgrade aiogram gallery-dl Pillow
 
 # Check gallery-dl version
 echo "gallery-dl version:"

@@ -1,4 +1,5 @@
 import asyncio
+import io
 import json
 import logging
 import re
@@ -11,6 +12,11 @@ from types import SimpleNamespace
 from pathlib import Path
 from datetime import datetime, timedelta
 from urllib.parse import urlparse
+
+try:
+    from PIL import Image
+except ImportError:
+    Image = None
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.client.default import DefaultBotProperties
@@ -202,6 +208,37 @@ def create_zip_file(zip_path: Path, images: list[Path]):
 def get_first_preview_image(images: list[Path]) -> Optional[Path]:
     existing = [img for img in images if img.exists() and img.suffix.lower() in IMAGE_EXTENSIONS]
     return sorted(existing, key=lambda x: x.name.lower())[0] if existing else None
+
+
+def ensure_telegram_photo_compatible(data: bytes, filename: str) -> tuple[bytes, str]:
+    """Telegram не вміє показувати превʼю для WebP (особливо анімованого),
+    тож конвертуємо такі файли в PNG/JPEG перед відправкою як photo."""
+    if Path(filename).suffix.lower() != '.webp':
+        return data, filename
+
+    if Image is None:
+        logging.warning(f"Pillow не встановлено — не можу конвертувати {filename} з WebP")
+        return data, filename
+
+    try:
+        with Image.open(io.BytesIO(data)) as img:
+            img.seek(0)  # перший кадр, якщо WebP анімований
+            if img.mode == 'P':
+                img = img.convert('RGBA' if 'transparency' in img.info else 'RGB')
+            elif img.mode not in ('RGB', 'RGBA'):
+                img = img.convert('RGBA')
+
+            out = io.BytesIO()
+            if img.mode == 'RGBA':
+                img.save(out, format='PNG')
+                new_name = Path(filename).stem + '.png'
+            else:
+                img.save(out, format='JPEG', quality=95)
+                new_name = Path(filename).stem + '.jpg'
+            return out.getvalue(), new_name
+    except Exception as e:
+        logging.error(f"Не вдалося конвертувати WebP {filename} для Telegram: {e}")
+        return data, filename
 
 
 def get_gallery_folder_and_names(folder: Path) -> tuple[str, str]:
@@ -421,8 +458,9 @@ async def send_selected_images_from_refs(
             if zp not in opened_zips:
                 opened_zips[zp] = zipfile.ZipFile(zp, 'r')
             data = opened_zips[zp].read(ref["image_name"])
+            data, photo_name = ensure_telegram_photo_compatible(data, Path(ref["image_name"]).name)
             batch.append(types.InputMediaPhoto(
-                media=types.BufferedInputFile(data, filename=Path(ref["image_name"]).name),
+                media=types.BufferedInputFile(data, filename=photo_name),
                 caption=f"🖼 {Path(ref['image_name']).name}" if len(batch) == 0 else None
             ))
             batch_refs.append(ref)
@@ -462,8 +500,9 @@ async def send_archive_preview(
                     # Читаємо безпосередньо з ZIP
                     with zipfile.ZipFile(refs[0]["zip_path"], 'r') as zf:
                         data = zf.read(refs[0]["image_name"])
+                    data, photo_name = ensure_telegram_photo_compatible(data, Path(refs[0]["image_name"]).name)
                     sent = await message.answer_photo(
-                        types.BufferedInputFile(data, filename=Path(refs[0]["image_name"]).name),
+                        types.BufferedInputFile(data, filename=photo_name),
                         caption=(
                             f"🖼 Превʼю архіву\n"
                             f"Назва: {gallery_name}\n"
@@ -488,8 +527,9 @@ async def send_archive_preview(
 
     try:
         data = preview_image.read_bytes()
+        data, photo_name = ensure_telegram_photo_compatible(data, preview_image.name)
         sent = await message.answer_photo(
-            types.BufferedInputFile(data, filename=preview_image.name),
+            types.BufferedInputFile(data, filename=photo_name),
             caption=(
                 f"🖼 Превʼю архіву\n"
                 f"Назва: {gallery_name}\n"
@@ -541,9 +581,10 @@ async def send_history_item_preview(message: types.Message, index: int, entry: d
         first_ref = image_refs[0]
         with zipfile.ZipFile(first_ref["zip_path"], 'r') as zf:
             preview_data = zf.read(first_ref["image_name"])
+        preview_data, photo_name = ensure_telegram_photo_compatible(preview_data, Path(first_ref["image_name"]).name)
 
         sent_preview = await message.answer_photo(
-            types.BufferedInputFile(preview_data, filename=Path(first_ref["image_name"]).name),
+            types.BufferedInputFile(preview_data, filename=photo_name),
             caption=(
                 f"🖼 Превʼю архіву\n"
                 f"Назва: {entry['gallery_name']}\n"
@@ -690,8 +731,9 @@ async def send_live_downloaded_image(
         return
     try:
         data = file_path.read_bytes()
+        data, photo_name = ensure_telegram_photo_compatible(data, file_path.name)
         sent = await message.answer_photo(
-            types.BufferedInputFile(data, filename=file_path.name),
+            types.BufferedInputFile(data, filename=photo_name),
             caption=f"📸 {file_path.name}"
         )
         state["live_sent_files"].add(key)
@@ -942,8 +984,9 @@ async def send_history_preview_images(message: types.Message, page_items: list[t
                     first_ref = refs[0]
                     with zipfile.ZipFile(first_ref["zip_path"], 'r') as zf:
                         preview_data = zf.read(first_ref["image_name"])
+                    preview_data, photo_name = ensure_telegram_photo_compatible(preview_data, Path(first_ref["image_name"]).name)
                     media.append(types.InputMediaPhoto(
-                        media=types.BufferedInputFile(preview_data, filename=Path(first_ref["image_name"]).name),
+                        media=types.BufferedInputFile(preview_data, filename=photo_name),
                         caption=f"{real_index + 1}. {entry['gallery_name'][:80]}"
                     ))
                     preview_added = True
@@ -1570,8 +1613,9 @@ async def send_existing_archive_from_history(message: types.Message, index: int)
             if refs:
                 with zipfile.ZipFile(refs[0]["zip_path"], 'r') as zf:
                     prev_data = zf.read(refs[0]["image_name"])
+                prev_data, photo_name = ensure_telegram_photo_compatible(prev_data, Path(refs[0]["image_name"]).name)
                 sent_prev = await message.answer_photo(
-                    types.BufferedInputFile(prev_data, filename=Path(refs[0]["image_name"]).name),
+                    types.BufferedInputFile(prev_data, filename=photo_name),
                     caption=f"🖼 Превʼю архіву\nНазва: {entry['gallery_name']}\nЗображень: {entry['image_count']}"
                 )
                 download_id = entry.get("_id")
