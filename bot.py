@@ -2156,9 +2156,10 @@ async def all_photos_callback(callback: types.CallbackQuery):
 
     if existing_zips:
         image_refs = get_image_refs_from_zip_parts(existing_zips)
-        selected_messages = find_image_messages_for_refs(image_refs, selected_indexes, image_messages)
-        if selected_messages and await forward_selected_images_from_history(selected_messages, list(range(len(selected_messages))), callback.message):
-            return
+        if not refs_have_webp(image_refs, selected_indexes):
+            selected_messages = find_image_messages_for_refs(image_refs, selected_indexes, image_messages)
+            if selected_messages and await forward_selected_images_from_history(selected_messages, list(range(len(selected_messages))), callback.message):
+                return
 
         await request_photo_send(image_refs, selected_indexes, callback.message, callback.from_user.id, index)
         return
@@ -2398,9 +2399,10 @@ async def handle_partial_selection(message: types.Message):
 
         if existing_zips:
             image_refs = get_image_refs_from_zip_parts(existing_zips)
-            selected_messages = find_image_messages_for_refs(image_refs, selected_indexes, image_messages)
-            if selected_messages and await forward_selected_images_from_history(selected_messages, list(range(len(selected_messages))), message):
-                return
+            if not refs_have_webp(image_refs, selected_indexes):
+                selected_messages = find_image_messages_for_refs(image_refs, selected_indexes, image_messages)
+                if selected_messages and await forward_selected_images_from_history(selected_messages, list(range(len(selected_messages))), message):
+                    return
 
             await request_photo_send(image_refs, selected_indexes, message, message.from_user.id, history_index)
             return
