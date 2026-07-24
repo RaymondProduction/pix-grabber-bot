@@ -87,7 +87,8 @@ CREATE TABLE IF NOT EXISTS image_messages (
     download_id INTEGER NOT NULL REFERENCES downloads(id) ON DELETE CASCADE,
     file_name   TEXT    NOT NULL DEFAULT '',
     chat_id     TEXT    NOT NULL,
-    message_id  INTEGER NOT NULL
+    message_id  INTEGER NOT NULL,
+    kind        TEXT    NOT NULL DEFAULT 'photo'
 );
 
 CREATE INDEX IF NOT EXISTS idx_image_messages_download ON image_messages(download_id);
@@ -106,7 +107,7 @@ CREATE TABLE IF NOT EXISTS schema_version (
 );
 """
 
-CURRENT_SCHEMA_VERSION = 2
+CURRENT_SCHEMA_VERSION = 3
 
 
 def init_db():
@@ -134,6 +135,8 @@ def _migrate(conn: sqlite3.Connection, from_version: int):
         _migrate_v0_to_v1(conn)
     if from_version < 2:
         _migrate_v1_to_v2(conn)
+    if from_version < 3:
+        _migrate_v2_to_v3(conn)
 
 
 def _migrate_v0_to_v1(conn: sqlite3.Connection):
@@ -181,9 +184,19 @@ def _migrate_v1_to_v2(conn: sqlite3.Connection):
 
 
 def _ensure_downloads_column(conn: sqlite3.Connection, name: str, definition: str):
-    columns = [row["name"] for row in conn.execute("PRAGMA table_info(downloads)").fetchall()]
+    _ensure_column(conn, "downloads", name, definition)
+
+
+def _ensure_column(conn: sqlite3.Connection, table: str, name: str, definition: str):
+    columns = [row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()]
     if name not in columns:
-        conn.execute(f"ALTER TABLE downloads ADD COLUMN {name} {definition}")
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+
+
+def _migrate_v2_to_v3(conn: sqlite3.Connection):
+    """Додає тип повідомлення (photo/document) для окремих фото — потрібно, щоб
+    коректно розрізняти вже конвертовані WebP-фото від надісланих як документ."""
+    _ensure_column(conn, "image_messages", "kind", "TEXT NOT NULL DEFAULT 'photo'")
 
 def _insert_legacy_entry(conn: sqlite3.Connection, entry: dict):
     """Вставляє один legacy-запис у нормалізовані таблиці."""
@@ -232,12 +245,13 @@ def _insert_legacy_entry(conn: sqlite3.Connection, entry: dict):
   # image_messages
     for im in (entry.get("image_messages") or []):
         conn.execute(
-            "INSERT INTO image_messages(download_id, file_name, chat_id, message_id) VALUES (?,?,?,?)",
+            "INSERT INTO image_messages(download_id, file_name, chat_id, message_id, kind) VALUES (?,?,?,?,?)",
             (
                 download_id,
                 im.get("file_name", ""),
                 str(im.get("chat_id", "")),
-                int(im.get("message_id", 0))
+                int(im.get("message_id", 0)),
+                im.get("kind", "photo")
             )
         )
 
@@ -271,11 +285,14 @@ def _row_to_entry(conn: sqlite3.Connection, row: sqlite3.Row) -> dict:
     archive_messages = [{"chat_id": r["chat_id"], "message_id": r["message_id"]} for r in archive_msg_rows]
 
     image_msg_rows = conn.execute(
-        "SELECT file_name, chat_id, message_id FROM image_messages WHERE download_id=? ORDER BY id",
+        "SELECT file_name, chat_id, message_id, kind FROM image_messages WHERE download_id=? ORDER BY id",
         (did,)
     ).fetchall()
     image_messages = [
-        {"file_name": r["file_name"], "chat_id": r["chat_id"], "message_id": r["message_id"]}
+        {
+            "file_name": r["file_name"], "chat_id": r["chat_id"], "message_id": r["message_id"],
+            "kind": r["kind"] if "kind" in r.keys() else "photo"
+        }
         for r in image_msg_rows
     ]
 
@@ -486,11 +503,11 @@ def append_archive_message(download_id: int, chat_id: str, message_id: int):
         )
 
 
-def append_image_message(download_id: int, file_name: str, chat_id: str, message_id: int):
+def append_image_message(download_id: int, file_name: str, chat_id: str, message_id: int, kind: str = "photo"):
     with get_db() as conn:
         conn.execute(
-            "INSERT INTO image_messages(download_id, file_name, chat_id, message_id) VALUES (?,?,?,?)",
-            (download_id, file_name, chat_id, message_id)
+            "INSERT INTO image_messages(download_id, file_name, chat_id, message_id, kind) VALUES (?,?,?,?,?)",
+            (download_id, file_name, chat_id, message_id, kind)
         )
 
 

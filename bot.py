@@ -430,8 +430,14 @@ async def forward_selected_images_from_history(
     return True
 
 
-def find_image_messages_for_refs(image_refs: list[dict], selected_indexes: list[int], image_messages: list[dict]) -> list[dict]:
-    by_name = {im.get("file_name", ""): im for im in image_messages if im.get("file_name")}
+def find_image_messages_for_refs(
+    image_refs: list[dict], selected_indexes: list[int], image_messages: list[dict],
+    kind: Optional[str] = None
+) -> list[dict]:
+    by_name = {
+        im.get("file_name", ""): im for im in image_messages
+        if im.get("file_name") and (kind is None or im.get("kind", "photo") == kind)
+    }
     selected_messages = []
 
     for index in selected_indexes:
@@ -490,7 +496,7 @@ async def send_selected_images_from_refs(
                 )
                 doc_count += 1
                 if history_index is not None:
-                    append_image_message_to_history(history_index, Path(ref["image_name"]), sent_message)
+                    append_image_message_to_history(history_index, Path(ref["image_name"]), sent_message, kind="document")
                 continue
 
             data, photo_name = ensure_telegram_photo_compatible(data, original_name)
@@ -562,18 +568,19 @@ async def webp_choice_callback(callback: types.CallbackQuery):
     message = pending["message"]
     history_index = pending["history_index"]
 
-    if choice == "photo":
-        # Якщо ці ж фото (вже конвертовані) хтось надсилав у чат раніше — просто
-        # пересилаємо готове повідомлення замість повторного завантаження й конвертації.
-        selected_messages = find_image_messages_for_refs(image_refs, selected_indexes, pending["image_messages"])
-        if selected_messages and await forward_selected_images_from_history(
-            selected_messages, list(range(len(selected_messages))), message
-        ):
-            return
-        await send_selected_images_from_refs(image_refs, selected_indexes, message, history_index, webp_as_documents=False)
+    # Якщо ці самі фото вже надсилались у чат раніше саме в такому вигляді (фото чи
+    # документ — залежно від вибору) — пересилаємо готове повідомлення замість
+    # повторного завантаження й конвертації.
+    reuse_kind = "photo" if choice == "photo" else "document"
+    selected_messages = find_image_messages_for_refs(image_refs, selected_indexes, pending["image_messages"], kind=reuse_kind)
+    if selected_messages and await forward_selected_images_from_history(
+        selected_messages, list(range(len(selected_messages))), message
+    ):
         return
 
-    await send_selected_images_from_refs(image_refs, selected_indexes, message, history_index, webp_as_documents=True)
+    await send_selected_images_from_refs(
+        image_refs, selected_indexes, message, history_index, webp_as_documents=(choice == "document")
+    )
 
 
 async def send_archive_preview(
@@ -739,12 +746,12 @@ def append_archive_message_to_history(history_index: int, sent_message: types.Me
         db.append_archive_message(download_id, str(sent_message.chat.id), sent_message.message_id)
 
 
-def append_image_message_to_history(history_index: int, image_path: Path, sent_message: types.Message):
+def append_image_message_to_history(history_index: int, image_path: Path, sent_message: types.Message, kind: str = "photo"):
     download_id = _get_download_id(history_index)
     if download_id:
         db.append_image_message(
             download_id, image_path.name,
-            str(sent_message.chat.id), sent_message.message_id
+            str(sent_message.chat.id), sent_message.message_id, kind
         )
 
 
@@ -2171,7 +2178,7 @@ async def all_photos_callback(callback: types.CallbackQuery):
     if existing_zips:
         image_refs = get_image_refs_from_zip_parts(existing_zips)
         if not refs_have_webp(image_refs, selected_indexes):
-            selected_messages = find_image_messages_for_refs(image_refs, selected_indexes, image_messages)
+            selected_messages = find_image_messages_for_refs(image_refs, selected_indexes, image_messages, kind="photo")
             if selected_messages and await forward_selected_images_from_history(selected_messages, list(range(len(selected_messages))), callback.message):
                 return
 
@@ -2414,7 +2421,7 @@ async def handle_partial_selection(message: types.Message):
         if existing_zips:
             image_refs = get_image_refs_from_zip_parts(existing_zips)
             if not refs_have_webp(image_refs, selected_indexes):
-                selected_messages = find_image_messages_for_refs(image_refs, selected_indexes, image_messages)
+                selected_messages = find_image_messages_for_refs(image_refs, selected_indexes, image_messages, kind="photo")
                 if selected_messages and await forward_selected_images_from_history(selected_messages, list(range(len(selected_messages))), message):
                     return
 
