@@ -516,7 +516,7 @@ async def send_selected_images_from_refs(
 
 async def request_photo_send(
     image_refs: list[dict], selected_indexes: list[int], message: types.Message,
-    user_id: int, history_index: Optional[int] = None
+    user_id: int, history_index: Optional[int] = None, image_messages: Optional[list[dict]] = None
 ):
     """Якщо серед обраних фото є WebP — питаємо користувача, конвертувати їх у фото
     (без анімації) чи надіслати як документи, перш ніж відправляти вибірку."""
@@ -533,6 +533,7 @@ async def request_photo_send(
         "selected_indexes": selected_indexes,
         "message": message,
         "history_index": history_index,
+        "image_messages": image_messages or [],
     }
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🖼 Конвертувати у фото", callback_data="webp_choice:photo")],
@@ -556,10 +557,23 @@ async def webp_choice_callback(callback: types.CallbackQuery):
         await callback.message.answer("⚠️ Запит застарів. Спробуй ще раз.", reply_markup=build_main_menu())
         return
 
-    await send_selected_images_from_refs(
-        pending["image_refs"], pending["selected_indexes"], pending["message"],
-        pending["history_index"], webp_as_documents=(choice == "document")
-    )
+    image_refs = pending["image_refs"]
+    selected_indexes = pending["selected_indexes"]
+    message = pending["message"]
+    history_index = pending["history_index"]
+
+    if choice == "photo":
+        # Якщо ці ж фото (вже конвертовані) хтось надсилав у чат раніше — просто
+        # пересилаємо готове повідомлення замість повторного завантаження й конвертації.
+        selected_messages = find_image_messages_for_refs(image_refs, selected_indexes, pending["image_messages"])
+        if selected_messages and await forward_selected_images_from_history(
+            selected_messages, list(range(len(selected_messages))), message
+        ):
+            return
+        await send_selected_images_from_refs(image_refs, selected_indexes, message, history_index, webp_as_documents=False)
+        return
+
+    await send_selected_images_from_refs(image_refs, selected_indexes, message, history_index, webp_as_documents=True)
 
 
 async def send_archive_preview(
@@ -2161,7 +2175,7 @@ async def all_photos_callback(callback: types.CallbackQuery):
             if selected_messages and await forward_selected_images_from_history(selected_messages, list(range(len(selected_messages))), callback.message):
                 return
 
-        await request_photo_send(image_refs, selected_indexes, callback.message, callback.from_user.id, index)
+        await request_photo_send(image_refs, selected_indexes, callback.message, callback.from_user.id, index, image_messages)
         return
 
     if image_messages:
@@ -2404,7 +2418,7 @@ async def handle_partial_selection(message: types.Message):
                 if selected_messages and await forward_selected_images_from_history(selected_messages, list(range(len(selected_messages))), message):
                     return
 
-            await request_photo_send(image_refs, selected_indexes, message, message.from_user.id, history_index)
+            await request_photo_send(image_refs, selected_indexes, message, message.from_user.id, history_index, image_messages)
             return
 
         if image_messages and await forward_selected_images_from_history(image_messages, selected_indexes, message):
