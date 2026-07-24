@@ -1245,28 +1245,33 @@ async def send_background_resumes(message: types.Message):
         return
 
     lines = ["⏳ <b>Фонові докачки</b>"]
+    item_buttons = []
 
     if scheduled:
         lines.append("\n✅ <b>Заплановані:</b>")
         for index, entry in scheduled[:10]:
             lines.append(format_background_resume_entry(index, entry, True))
+            item_buttons.append([build_history_item_button(index, entry)])
 
     if unscheduled:
         lines.append("\n⚠️ <b>Не заплановані:</b>")
         for index, entry in unscheduled[:10]:
             lines.append(format_background_resume_entry(index, entry, False))
+            item_buttons.append([build_history_item_button(index, entry)])
 
     if without_resume_url:
         lines.append("\n🚫 <b>Без resume URL:</b>")
         for index, entry in without_resume_url[:10]:
             title = entry.get("gallery_name") or "Без назви"
             lines.append(f"• #{index + 1}: <b>{html.escape(title[:80])}</b>")
+            item_buttons.append([build_history_item_button(index, entry)])
 
     buttons = []
     if unscheduled:
         buttons.append([InlineKeyboardButton(text="⏳ Запланувати незаплановані", callback_data="schedule_background_resumes")])
     if scheduled or unscheduled:
         buttons.append([InlineKeyboardButton(text="▶️ Запустити наступну докачку зараз", callback_data="start_next_background_resume")])
+    buttons.extend(item_buttons)
     buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_start")])
 
     await message.answer("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
