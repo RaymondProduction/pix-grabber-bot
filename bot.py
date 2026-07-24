@@ -48,6 +48,7 @@ PENDING_SEARCH_REQUESTS = set()
 PENDING_DOWNLOAD_REQUESTS = {}
 PENDING_DELETE_REQUESTS = {}  # user_id -> history_index
 PENDING_HISTORY_PAGE_REQUESTS = {}  # user_id -> "plain" | "preview"
+LAST_HISTORY_PAGE = {}  # user_id -> {"plain": page, "preview": page}
 PENDING_WEBP_REQUESTS = {}  # user_id -> {"image_refs", "selected_indexes", "message", "history_index"}
 download_queue: Optional[asyncio.Queue] = None
 queue_worker_started = False
@@ -1006,6 +1007,14 @@ def get_history_page_items(history: list, page: int) -> list[tuple[int, dict]]:
     return reversed_items[start:end]
 
 
+def get_last_history_page(user_id: int, preview: bool) -> int:
+    return LAST_HISTORY_PAGE.get(user_id, {}).get("preview" if preview else "plain", 0)
+
+
+def set_last_history_page(user_id: int, page: int, preview: bool):
+    LAST_HISTORY_PAGE.setdefault(user_id, {})["preview" if preview else "plain"] = page
+
+
 def build_history_item_button(real_index: int, entry: dict) -> InlineKeyboardButton:
     status = entry.get("status", "done")
     if status == "interrupted":
@@ -1060,6 +1069,14 @@ async def send_history(message: types.Message, page: int = 0):
         nav.append(InlineKeyboardButton(text="➡️ Далі", callback_data=f"history_page:{page + 1}"))
     if nav:
         buttons.append(nav)
+
+    jump = []
+    if page > 1:
+        jump.append(InlineKeyboardButton(text="⏮ На початок", callback_data="history_page:0"))
+    if page < page_count - 2:
+        jump.append(InlineKeyboardButton(text="⏭ В кінець", callback_data=f"history_page:{page_count - 1}"))
+    if jump:
+        buttons.append(jump)
 
     if page_count > 1:
         buttons.append([InlineKeyboardButton(text="🔢 Обрати сторінки", callback_data="select_history_pages:plain")])
@@ -1149,6 +1166,14 @@ async def send_history_with_preview(message: types.Message, page: int = 0):
         nav.append(InlineKeyboardButton(text="➡️ Далі", callback_data=f"history_preview_page:{page + 1}"))
     if nav:
         buttons.append(nav)
+
+    jump = []
+    if page > 1:
+        jump.append(InlineKeyboardButton(text="⏮ На початок", callback_data="history_preview_page:0"))
+    if page < page_count - 2:
+        jump.append(InlineKeyboardButton(text="⏭ В кінець", callback_data=f"history_preview_page:{page_count - 1}"))
+    if jump:
+        buttons.append(jump)
 
     if page_count > 1:
         buttons.append([InlineKeyboardButton(text="🔢 Обрати сторінки", callback_data="select_history_pages:preview")])
@@ -1812,13 +1837,13 @@ async def disk_usage_callback(callback: types.CallbackQuery):
 @dp.callback_query(F.data == "show_history")
 async def show_history_callback(callback: types.CallbackQuery):
     await callback.answer()
-    await send_history(callback.message, page=0)
+    await send_history(callback.message, page=get_last_history_page(callback.from_user.id, preview=False))
 
 
 @dp.callback_query(F.data == "show_history_preview")
 async def show_history_preview_callback(callback: types.CallbackQuery):
     await callback.answer()
-    await send_history_with_preview(callback.message, page=0)
+    await send_history_with_preview(callback.message, page=get_last_history_page(callback.from_user.id, preview=True))
 
 @dp.callback_query(F.data == "search_history")
 async def search_history_callback(callback: types.CallbackQuery):
@@ -1836,6 +1861,7 @@ async def search_history_callback(callback: types.CallbackQuery):
 @dp.callback_query(F.data.startswith("history_page:"))
 async def history_page_callback(callback: types.CallbackQuery):
     page = int(callback.data.split(":", 1)[1])
+    set_last_history_page(callback.from_user.id, page, preview=False)
     await callback.answer()
     await send_history(callback.message, page=page)
 
@@ -1843,6 +1869,7 @@ async def history_page_callback(callback: types.CallbackQuery):
 @dp.callback_query(F.data.startswith("history_preview_page:"))
 async def history_preview_page_callback(callback: types.CallbackQuery):
     page = int(callback.data.split(":", 1)[1])
+    set_last_history_page(callback.from_user.id, page, preview=True)
     await callback.answer()
     await send_history_with_preview(callback.message, page=page)
 
@@ -2344,7 +2371,7 @@ async def cmd_search(message: types.Message):
 
 @dp.message(Command("history"))
 async def cmd_history(message: types.Message):
-    await send_history(message)
+    await send_history(message, page=get_last_history_page(message.from_user.id, preview=False))
 
 
 @dp.message(Command("start"))
