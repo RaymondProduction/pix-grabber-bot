@@ -107,7 +107,7 @@ CREATE TABLE IF NOT EXISTS schema_version (
 );
 """
 
-CURRENT_SCHEMA_VERSION = 3
+CURRENT_SCHEMA_VERSION = 4
 
 
 def init_db():
@@ -137,6 +137,8 @@ def _migrate(conn: sqlite3.Connection, from_version: int):
         _migrate_v1_to_v2(conn)
     if from_version < 3:
         _migrate_v2_to_v3(conn)
+    if from_version < 4:
+        _migrate_v3_to_v4(conn)
 
 
 def _migrate_v0_to_v1(conn: sqlite3.Connection):
@@ -197,6 +199,25 @@ def _migrate_v2_to_v3(conn: sqlite3.Connection):
     """Додає тип повідомлення (photo/document) для окремих фото — потрібно, щоб
     коректно розрізняти вже конвертовані WebP-фото від надісланих як документ."""
     _ensure_column(conn, "image_messages", "kind", "TEXT NOT NULL DEFAULT 'photo'")
+
+
+def _migrate_v3_to_v4(conn: sqlite3.Connection):
+    """Прибирає накопичені дублікати image_messages (кожне повторне надсилання того
+    самого файлу раніше додавало новий рядок замість оновлення) і додає UNIQUE-індекс,
+    щоб append_image_message міг робити upsert і дублікати більше не накопичувались."""
+    conn.execute(
+        """
+        DELETE FROM image_messages
+        WHERE id NOT IN (
+            SELECT MAX(id) FROM image_messages GROUP BY download_id, file_name, kind
+        )
+        """
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_image_messages_unique "
+        "ON image_messages(download_id, file_name, kind)"
+    )
+
 
 def _insert_legacy_entry(conn: sqlite3.Connection, entry: dict):
     """Вставляє один legacy-запис у нормалізовані таблиці."""
@@ -506,7 +527,8 @@ def append_archive_message(download_id: int, chat_id: str, message_id: int):
 def append_image_message(download_id: int, file_name: str, chat_id: str, message_id: int, kind: str = "photo"):
     with get_db() as conn:
         conn.execute(
-            "INSERT INTO image_messages(download_id, file_name, chat_id, message_id, kind) VALUES (?,?,?,?,?)",
+            "INSERT OR REPLACE INTO image_messages(download_id, file_name, chat_id, message_id, kind) "
+            "VALUES (?,?,?,?,?)",
             (download_id, file_name, chat_id, message_id, kind)
         )
 
