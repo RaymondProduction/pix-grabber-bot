@@ -48,6 +48,7 @@ PENDING_SEARCH_REQUESTS = set()
 PENDING_DOWNLOAD_REQUESTS = {}
 PENDING_DELETE_REQUESTS = {}  # user_id -> history_index
 PENDING_HISTORY_PAGE_REQUESTS = {}  # user_id -> "plain" | "preview"
+PENDING_WEBP_REQUESTS = {}  # user_id -> {"image_refs", "selected_indexes", "message", "history_index"}
 download_queue: Optional[asyncio.Queue] = None
 queue_worker_started = False
 active_downloads = 0
@@ -447,35 +448,118 @@ def find_image_messages_for_refs(image_refs: list[dict], selected_indexes: list[
     return selected_messages
 
 
+def refs_have_webp(image_refs: list[dict], selected_indexes: list[int]) -> bool:
+    return any(
+        Path(image_refs[i]["image_name"]).suffix.lower() == '.webp'
+        for i in selected_indexes if i < len(image_refs)
+    )
+
+
 async def send_selected_images_from_refs(
-    image_refs: list[dict], selected_indexes: list[int], message: types.Message, history_index: Optional[int] = None
+    image_refs: list[dict], selected_indexes: list[int], message: types.Message,
+    history_index: Optional[int] = None, webp_as_documents: bool = False
 ):
     selected_refs = [image_refs[i] for i in selected_indexes]
-    batch, batch_refs, sent_count, opened_zips = [], [], 0, {}
+    batch, batch_refs, sent_count, doc_count, opened_zips = [], [], 0, 0, {}
+
+    async def flush_batch():
+        nonlocal sent_count
+        if not batch:
+            return
+        sent_messages = await message.answer_media_group(batch)
+        sent_count += len(batch)
+        if history_index is not None:
+            for sent_message, sent_ref in zip(sent_messages, batch_refs):
+                append_image_message_to_history(history_index, Path(sent_ref["image_name"]), sent_message)
+        batch.clear()
+        batch_refs.clear()
+
     try:
-        for idx, ref in enumerate(selected_refs, start=1):
+        for ref in selected_refs:
             zp = ref["zip_path"]
             if zp not in opened_zips:
                 opened_zips[zp] = zipfile.ZipFile(zp, 'r')
             data = opened_zips[zp].read(ref["image_name"])
-            data, photo_name = ensure_telegram_photo_compatible(data, Path(ref["image_name"]).name)
+            original_name = Path(ref["image_name"]).name
+
+            if webp_as_documents and original_name.lower().endswith('.webp'):
+                await flush_batch()
+                sent_message = await message.answer_document(
+                    types.BufferedInputFile(data, filename=original_name),
+                    caption=f"📄 {original_name}"
+                )
+                doc_count += 1
+                if history_index is not None:
+                    append_image_message_to_history(history_index, Path(ref["image_name"]), sent_message)
+                continue
+
+            data, photo_name = ensure_telegram_photo_compatible(data, original_name)
             batch.append(types.InputMediaPhoto(
                 media=types.BufferedInputFile(data, filename=photo_name),
-                caption=f"🖼 {Path(ref['image_name']).name}" if len(batch) == 0 else None
+                caption=f"🖼 {original_name}" if len(batch) == 0 else None
             ))
             batch_refs.append(ref)
-            if len(batch) == 10 or idx == len(selected_refs):
-                sent_messages = await message.answer_media_group(batch)
-                sent_count += len(batch)
-                if history_index is not None:
-                    for sent_message, sent_ref in zip(sent_messages, batch_refs):
-                        append_image_message_to_history(history_index, Path(sent_ref["image_name"]), sent_message)
-                batch = []
-                batch_refs = []
+            if len(batch) == 10:
+                await flush_batch()
+        await flush_batch()
     finally:
         for zf in opened_zips.values():
             zf.close()
-    await message.answer(f"✅ Відправлено {sent_count} фото.", reply_markup=build_main_menu())
+
+    parts = []
+    if sent_count:
+        parts.append(f"{sent_count} фото")
+    if doc_count:
+        parts.append(f"{doc_count} документів (WebP)")
+    await message.answer(f"✅ Відправлено {' і '.join(parts) if parts else '0 фото'}.", reply_markup=build_main_menu())
+
+
+async def request_photo_send(
+    image_refs: list[dict], selected_indexes: list[int], message: types.Message,
+    user_id: int, history_index: Optional[int] = None
+):
+    """Якщо серед обраних фото є WebP — питаємо користувача, конвертувати їх у фото
+    (без анімації) чи надіслати як документи, перш ніж відправляти вибірку."""
+    if not refs_have_webp(image_refs, selected_indexes):
+        await send_selected_images_from_refs(image_refs, selected_indexes, message, history_index)
+        return
+
+    webp_count = sum(
+        1 for i in selected_indexes
+        if i < len(image_refs) and Path(image_refs[i]["image_name"]).suffix.lower() == '.webp'
+    )
+    PENDING_WEBP_REQUESTS[user_id] = {
+        "image_refs": image_refs,
+        "selected_indexes": selected_indexes,
+        "message": message,
+        "history_index": history_index,
+    }
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🖼 Конвертувати у фото", callback_data="webp_choice:photo")],
+        [InlineKeyboardButton(text="📄 Надіслати як документи", callback_data="webp_choice:document")],
+    ])
+    await message.answer(
+        f"⚠️ Серед обраних фото є <b>{webp_count}</b> WebP.\n"
+        f"Telegram не показує анімацію WebP у фото-режимі.\n\n"
+        f"Конвертувати їх у звичайне фото (без анімації) чи надіслати такі файли як документи "
+        f"(оригінал, з анімацією, якщо вона є)?",
+        reply_markup=keyboard
+    )
+
+
+@dp.callback_query(F.data.startswith("webp_choice:"))
+async def webp_choice_callback(callback: types.CallbackQuery):
+    choice = callback.data.split(":", 1)[1]
+    pending = PENDING_WEBP_REQUESTS.pop(callback.from_user.id, None)
+    await callback.answer()
+    if not pending:
+        await callback.message.answer("⚠️ Запит застарів. Спробуй ще раз.", reply_markup=build_main_menu())
+        return
+
+    await send_selected_images_from_refs(
+        pending["image_refs"], pending["selected_indexes"], pending["message"],
+        pending["history_index"], webp_as_documents=(choice == "document")
+    )
 
 
 async def send_archive_preview(
@@ -2076,7 +2160,7 @@ async def all_photos_callback(callback: types.CallbackQuery):
         if selected_messages and await forward_selected_images_from_history(selected_messages, list(range(len(selected_messages))), callback.message):
             return
 
-        await send_selected_images_from_refs(image_refs, selected_indexes, callback.message, index)
+        await request_photo_send(image_refs, selected_indexes, callback.message, callback.from_user.id, index)
         return
 
     if image_messages:
@@ -2318,7 +2402,7 @@ async def handle_partial_selection(message: types.Message):
             if selected_messages and await forward_selected_images_from_history(selected_messages, list(range(len(selected_messages))), message):
                 return
 
-            await send_selected_images_from_refs(image_refs, selected_indexes, message, history_index)
+            await request_photo_send(image_refs, selected_indexes, message, message.from_user.id, history_index)
             return
 
         if image_messages and await forward_selected_images_from_history(image_messages, selected_indexes, message):
