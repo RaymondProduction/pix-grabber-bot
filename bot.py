@@ -1015,20 +1015,23 @@ def set_last_history_page(user_id: int, page: int, preview: bool):
     LAST_HISTORY_PAGE.setdefault(user_id, {})["preview" if preview else "plain"] = page
 
 
-def build_history_item_button(real_index: int, entry: dict) -> InlineKeyboardButton:
+def get_history_item_marker(entry: dict) -> str:
     status = entry.get("status", "done")
     if status == "interrupted":
-        marker = "⏸"
-    elif status == "failed":
-        marker = "🚫"
-    elif Path(entry.get("zip_path", "")).exists() \
-         or entry.get("archive_message_id") \
-         or entry.get("archive_messages"):
-        marker = "✅"
-    elif status == "in_progress":
-        marker = "🟡"
-    else:
-        marker = "❌"
+        return "⏸"
+    if status == "failed":
+        return "🚫"
+    if Path(entry.get("zip_path", "")).exists() \
+       or entry.get("archive_message_id") \
+       or entry.get("archive_messages"):
+        return "✅"
+    if status == "in_progress":
+        return "🟡"
+    return "❌"
+
+
+def build_history_item_button(real_index: int, entry: dict) -> InlineKeyboardButton:
+    marker = get_history_item_marker(entry)
     label = f"{marker} {entry['gallery_name'][:40]} ({entry['image_count']} шт.) — {entry['date']}"
     return InlineKeyboardButton(text=label, callback_data=f"history_item:{real_index}")
 
@@ -1242,24 +1245,34 @@ def get_background_resume_items() -> tuple[list[tuple[int, dict]], list[tuple[in
     return scheduled, unscheduled, without_resume_url
 
 
-def format_background_resume_entry(index: int, entry: dict, scheduled: bool) -> str:
+def format_background_resume_retry_line(entry: dict, scheduled: bool) -> str:
     retry_count = int(entry.get("retry_count") or 0)
     next_retry = retry_count if scheduled else retry_count + 1
-    title = entry.get("gallery_name") or "Без назви"
 
     if scheduled:
-        return (
-            f"• #{index + 1}: <b>{html.escape(title[:80])}</b>\n"
-            f"  Спроба автодокачки: <b>{next_retry}</b>\n"
-            f"  Запуск: <code>{entry.get('auto_resume_at')}</code>"
-        )
+        return f"🔁 Спроба автодокачки: <b>{next_retry}</b> • запуск <code>{entry.get('auto_resume_at')}</code>"
 
     delay = get_auto_resume_delay(next_retry)
-    return (
-        f"• #{index + 1}: <b>{html.escape(title[:80])}</b>\n"
-        f"  Не заплановано\n"
-        f"  Наступна спроба буде: <b>{next_retry}</b> через {format_auto_resume_delay(delay)}"
+    return f"🔁 Наступна спроба: <b>{next_retry}</b> через {format_auto_resume_delay(delay)}"
+
+
+async def send_background_resume_item(message: types.Message, index: int, entry: dict, retry_line: str = ""):
+    await send_history_item_preview(message, index, entry)
+
+    marker = get_history_item_marker(entry)
+    title = entry.get("gallery_name") or "Без назви"
+    lines = [f"{marker} <b>{html.escape(title[:80])}</b> (#{index + 1})"]
+    if retry_line:
+        lines.append(retry_line)
+    lines.append(f"🖼 Зображень: {entry.get('image_count', 0)}")
+    lines.append(f"📅 {entry.get('date', '')}")
+    lines.append(f"🔗 {entry.get('url', '')}")
+
+    keyboard = (
+        build_resume_keyboard(index) if entry.get("resume_url")
+        else build_redownload_keyboard(entry.get("url", ""))
     )
+    await message.answer("\n".join(lines), reply_markup=keyboard)
 
 
 async def send_background_resumes(message: types.Message):
@@ -1269,37 +1282,31 @@ async def send_background_resumes(message: types.Message):
         await message.answer("⏳ Фонових докачок немає.", reply_markup=build_main_menu())
         return
 
-    lines = ["⏳ <b>Фонові докачки</b>"]
-    item_buttons = []
+    await message.answer("⏳ <b>Фонові докачки</b>")
 
     if scheduled:
-        lines.append("\n✅ <b>Заплановані:</b>")
+        await message.answer("✅ <b>Заплановані:</b>")
         for index, entry in scheduled[:10]:
-            lines.append(format_background_resume_entry(index, entry, True))
-            item_buttons.append([build_history_item_button(index, entry)])
+            await send_background_resume_item(message, index, entry, format_background_resume_retry_line(entry, True))
 
     if unscheduled:
-        lines.append("\n⚠️ <b>Не заплановані:</b>")
+        await message.answer("⚠️ <b>Не заплановані:</b>")
         for index, entry in unscheduled[:10]:
-            lines.append(format_background_resume_entry(index, entry, False))
-            item_buttons.append([build_history_item_button(index, entry)])
+            await send_background_resume_item(message, index, entry, format_background_resume_retry_line(entry, False))
 
     if without_resume_url:
-        lines.append("\n🚫 <b>Без resume URL:</b>")
+        await message.answer("🚫 <b>Без resume URL:</b>")
         for index, entry in without_resume_url[:10]:
-            title = entry.get("gallery_name") or "Без назви"
-            lines.append(f"• #{index + 1}: <b>{html.escape(title[:80])}</b>")
-            item_buttons.append([build_history_item_button(index, entry)])
+            await send_background_resume_item(message, index, entry)
 
     buttons = []
     if unscheduled:
         buttons.append([InlineKeyboardButton(text="⏳ Запланувати незаплановані", callback_data="schedule_background_resumes")])
     if scheduled or unscheduled:
         buttons.append([InlineKeyboardButton(text="▶️ Запустити наступну докачку зараз", callback_data="start_next_background_resume")])
-    buttons.extend(item_buttons)
     buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_start")])
 
-    await message.answer("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    await message.answer("Дії з чергою фонових докачок:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
 
 
 def schedule_entry_for_background_resume(index: int, entry: dict, chat_id: int) -> bool:
