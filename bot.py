@@ -2404,6 +2404,13 @@ async def handle_partial_selection(message: types.Message):
             await message.answer(f"⚠️ {e}\n\nСпробуй ще раз. Приклади: <code>1-3</code>, <code>1,3,5</code>")
             PENDING_HISTORY_PAGE_REQUESTS[message.from_user.id] = mode
             return
+
+        normalized = message.text.strip().replace(' ', '')
+        first_part = next((p for p in normalized.split(',') if p), '')
+        if first_part:
+            first_page = int(first_part.split('-')[0]) - 1
+            set_last_history_page(message.from_user.id, first_page, preview=(mode == "preview"))
+
         await send_history_selected_pages(message, pages, preview=(mode == "preview"))
         return
 
