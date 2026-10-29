@@ -8,6 +8,7 @@ import signal
 import zipfile
 import shutil
 import sys
+from collections import deque
 from typing import Optional
 from types import SimpleNamespace
 from pathlib import Path
@@ -23,6 +24,7 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
+from aiogram.exceptions import TelegramAPIError
 from aiogram import F
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
@@ -785,6 +787,25 @@ def create_streaming_zip_part(folder: Path, images: list[Path], safe_name: str, 
     return zip_path
 
 
+def create_sized_zip_parts(folder, images, safe_name, first_part_number, max_size):
+    """Перевіряє розмір готового ZIP, включно зі службовими даними."""
+    pending = deque(split_images_by_size(images, max_size))
+    part_number = first_part_number
+    while pending:
+        group = pending.popleft()
+        path = create_streaming_zip_part(folder, group, safe_name, part_number)
+        if path.stat().st_size > max_size:
+            path.unlink()
+            if len(group) == 1:
+                raise ValueError(f"Зображення {group[0].name} завелике для однієї частини ZIP")
+            middle = len(group) // 2
+            pending.appendleft(group[middle:])
+            pending.appendleft(group[:middle])
+            continue
+        yield path, group
+        part_number += 1
+
+
 def append_zip_part_to_history(history_index: int, zip_path: Path):
     # Використовуємо тільки append_zip_part — він додає до існуючих частин,
     # не перезаписує весь список. update_history_entry тут не потрібен.
@@ -813,6 +834,7 @@ async def send_single_archive_part(
     gallery_name: str, part_number: int, image_count: int,
     history_index: int, is_final_part: bool = False
 ):
+    gallery_name = html.escape(gallery_name)
     if part_number == 1 and is_final_part:
         caption = f"📦 Готово!\nЗображень: {image_count}\nНазва: {gallery_name}"
     elif is_final_part:
@@ -850,33 +872,40 @@ async def flush_archive_part(
         state["gallery_name"] = gallery_name
         state["safe_name"] = safe_name
 
+    # Зберігаємо всі частини й лічильники до першого мережевого await:
+    # монітор може бути скасований, щойно gallery-dl завершить роботу.
+    prepared = []
+    for zip_path, group in create_sized_zip_parts(
+        folder, images, safe_name, state["part_number"] + 1, MAX_ARCHIVE_PART_SIZE
+    ):
+        state["part_number"] += 1
+        append_zip_part_to_history(history_index, zip_path)
+        state["zip_paths"].append(str(zip_path))
+        state["image_count"] += len(group)
+        state.setdefault("pending_cleanup", []).extend(group)
+        archived = set(group)
+        state["pending_files"] = [p for p in state.get("pending_files", []) if p not in archived]
+        db.update_history_entry(
+            history_index, gallery_name=gallery_name,
+            image_count=state["image_count"] + state.get("prev_image_count", 0),
+            status="in_progress"
+        )
+        prepared.append((zip_path, state["part_number"], len(group)))
+
     if not state.get("preview_sent"):
         await send_archive_preview(message, get_first_preview_image(images), gallery_name, 0, history_index)
         state["preview_sent"] = True
 
-    state["part_number"] += 1
-    part_number = state["part_number"]
-    zip_path = create_streaming_zip_part(folder, images, safe_name, part_number)
-
-    # Додаємо нову частину через append (не перезаписуємо весь список)
-    append_zip_part_to_history(history_index, zip_path)
-    state["zip_paths"].append(str(zip_path))
-    state["image_count"] += len(images)
-    state.setdefault("pending_cleanup", []).extend(images)
-
-    await send_single_archive_part(
-        message=message, zip_path=zip_path, gallery_name=gallery_name,
-        part_number=part_number, image_count=len(images),
-        history_index=history_index, is_final_part=is_final_part
-    )
-
-    # Оновлюємо тільки скалярні поля — zip_parts не чіпаємо, вони вже в БД через append
-    db.update_history_entry(
-        history_index,
-        gallery_name=gallery_name,
-        image_count=state["image_count"] + state.get("prev_image_count", 0),
-        status="in_progress"
-    )
+    for zip_path, part_number, image_count in prepared:
+        try:
+            await send_single_archive_part(
+                message=message, zip_path=zip_path, gallery_name=gallery_name,
+                part_number=part_number, image_count=image_count,
+                history_index=history_index,
+                is_final_part=is_final_part and part_number == state["part_number"]
+            )
+        except TelegramAPIError as e:
+            logging.warning("Архів %s збережено, але не надіслано: %s", zip_path.name, e)
 
 
 async def send_live_downloaded_image(
@@ -932,7 +961,6 @@ async def monitor_folder_and_send_archives(
             pending_size = sum(img.stat().st_size for img in state["pending_files"] if img.exists())
             if pending_size >= ARCHIVE_FLUSH_SIZE:
                 images_to_flush = [img for img in state["pending_files"] if img.exists()]
-                state["pending_files"] = []
                 await flush_archive_part(folder, message, history_index, state, images_to_flush)
         except asyncio.CancelledError:
             raise
@@ -952,7 +980,6 @@ async def flush_remaining_downloaded_images(
             state["last_image_at"] = asyncio.get_running_loop().time()
 
     remaining = [img for img in state["pending_files"] if img.exists()]
-    state["pending_files"] = []
     if remaining:
         await flush_archive_part(folder, message, history_index, state, remaining, is_final_part=True)
 
@@ -962,13 +989,17 @@ async def finalize_streaming_archives(
 ):
     await flush_remaining_downloaded_images(folder, message, history_index, state)
 
-    if state["image_count"] == 0:
+    total_image_count = state["image_count"] + state.get("prev_image_count", 0)
+    if total_image_count == 0:
+        db.update_history_entry(
+            history_index, gallery_name="Зображень не знайдено", status="failed",
+            image_count=0, resume_url="", auto_resume_at="", auto_resume_chat_id=""
+        )
         await message.answer("Не знайдено зображень для архіву.", reply_markup=build_main_menu())
         return
 
     gallery_name = state.get("gallery_name") or folder.name
     # Рахуємо загальну кількість зображень: поточний сеанс + попередні сеанси
-    total_image_count = state["image_count"] + state.get("prev_image_count", 0)
     db.update_history_entry(
         history_index,
         gallery_name=gallery_name,
@@ -982,10 +1013,14 @@ async def finalize_streaming_archives(
     cleanup_all_downloaded_images(state)
     cleanup_download_folder(folder)
 
+    entry = db.load_history()[history_index]
+    delivery_note = ""
+    if len(entry.get("archive_messages") or []) < len(entry.get("zip_parts") or []):
+        delivery_note = "\n⚠️ Частину архівів не надіслано. Вони збережені — відкрий запис в історії та надішли архів повторно."
     await message.answer(
         f"✅ Скачування завершено.\n"
         f"📦 Архівних частин (цей сеанс): {len(state['zip_paths'])}\n"
-        f"🖼 Зображень загалом: {total_image_count}",
+        f"🖼 Зображень загалом: {total_image_count}{delivery_note}",
         reply_markup=build_main_menu()
     )
 
@@ -1393,7 +1428,6 @@ async def run_download(message: types.Message, url: str, history_index: int, dow
         sys.executable, "-m", "gallery_dl",
         "--dest", str(download_dir),
         "--filename", "{num:0>4}.{extension}",
-        "--no-part",
         "--no-mtime",
         "--retries",      str(CONFIG.get("gallery_dl_retries", 5)),
         "--sleep",        str(CONFIG.get("gallery_dl_sleep", 1)),
@@ -1700,12 +1734,20 @@ async def queue_worker():
     queue = get_download_queue()
     while True:
         message, url, history_index, download_dir = await queue.get()
+        download_id = db.find_download_id_by_index(history_index)
         active_downloads += 1
         try:
             await run_download(message, url, history_index, download_dir)
         except Exception as e:
             logging.exception(f"Помилка в черзі для {url}: {e}")
-            await send_start_menu(message)
+            db.mark_download_interrupted(download_id)
+            try:
+                await message.answer(
+                    "⚠️ Не вдалося завершити обробку. Збережені файли залишилися на сервері; перевір запис в історії.",
+                    reply_markup=build_main_menu()
+                )
+            except Exception:
+                logging.exception("Не вдалося повідомити про помилку завантаження")
         finally:
             active_downloads -= 1
             queue.task_done()
@@ -1846,7 +1888,7 @@ async def send_existing_archive_from_history(message: types.Message, index: int)
         except Exception as e:
             logging.error(f"Не вдалося відправити превʼю з ZIP: {e}")
 
-    if archive_messages:
+    if archive_messages and (not zip_parts or len(archive_messages) == len(zip_parts)):
         try:
             forwarded = 0
             for am in archive_messages:

@@ -381,6 +381,19 @@ def add_history_entry(url: str, download_dir: str) -> int:
     return total - 1
 
 
+def mark_download_interrupted(download_id: Optional[int]):
+    """Не залишаємо аварійно завершену задачу активною; ID не зсувається при видаленні."""
+    with get_db() as conn:
+        conn.execute(
+            """UPDATE downloads SET status='interrupted', auto_resume_at='',
+                      auto_resume_chat_id='',
+                      gallery_name=CASE WHEN gallery_name='in_progress'
+                                        THEN 'Завантаження перервано' ELSE gallery_name END
+               WHERE id=? AND status='in_progress'""",
+            (download_id,)
+        )
+
+
 def update_history_entry(index: int, **kwargs):
     """
     Оновлює запис за порядковим індексом.
