@@ -2,3 +2,4 @@ images
 config.json
 venv
 history.json
+.pixiv-auth/

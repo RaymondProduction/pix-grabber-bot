@@ -7,6 +7,7 @@ import html
 import signal
 import zipfile
 import shutil
+import sys
 from typing import Optional
 from types import SimpleNamespace
 from pathlib import Path
@@ -26,6 +27,7 @@ from aiogram import F
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 import db
+from pixiv_auth import PixivAuth, PixivAuthError, is_oauth_response, is_pixiv_url
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -34,6 +36,7 @@ with open('config.json', 'r', encoding='utf-8') as f:
 
 bot = Bot(token=CONFIG["telegram_token"], default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
+pixiv_auth = PixivAuth()
 
 BASE_DOWNLOAD_DIR = Path("images")
 BASE_DOWNLOAD_DIR.mkdir(exist_ok=True)
@@ -87,6 +90,54 @@ def get_download_queue() -> asyncio.Queue:
     if download_queue is None:
         download_queue = asyncio.Queue()
     return download_queue
+
+
+def build_pixiv_login_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔐 Підключити Pixiv", callback_data="pixiv_login")],
+    ])
+
+
+async def start_pixiv_login(message: types.Message, gallery_url: Optional[str] = None):
+    if message.chat.type != "private":
+        await message.answer("Підключення Pixiv доступне в особистому чаті з ботом. Надішли там /pixiv_login.")
+        return
+    try:
+        session = pixiv_auth.begin(message.chat.id, gallery_url)
+    except PixivAuthError as e:
+        await message.answer(str(e))
+        return
+    PENDING_SEARCH_REQUESTS.discard(message.chat.id)
+    for pending in (PENDING_PARTIAL_REQUESTS, PENDING_DELETE_REQUESTS,
+                    PENDING_HISTORY_PAGE_REQUESTS, PENDING_WEBP_REQUESTS):
+        pending.pop(message.chat.id, None)
+    await message.answer(
+        "🔐 <b>Підключення Pixiv</b>\n\n"
+        "1. Відкрий посилання нижче у звичайному браузері на комп’ютері.\n"
+        "2. До входу натисни <b>F12</b> і відкрий вкладку <b>Мережа (Network)</b>.\n"
+        "3. Увійди у свій обліковий запис Pixiv.\n"
+        "4. Знайди останній запит <code>callback?state=…</code>.\n"
+        "5. Скопіюй параметр <code>code</code> і надішли його сюди. "
+        "Можна надіслати повну адресу цього запиту.\n\n"
+        "⏱ Код діє приблизно <b>30 секунд після входу</b> — надішли його одразу.\n"
+        "Використовуй саме посилання з цього повідомлення.\n"
+        "Для скасування: /cancel.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🌐 Увійти в Pixiv", url=session.login_url)],
+            [InlineKeyboardButton(text="✖️ Скасувати вхід", callback_data="pixiv_login_cancel")],
+        ]),
+    )
+
+
+async def request_pixiv_login(message: types.Message, url: str):
+    if message.chat.id <= 0:
+        await message.answer("Для завантаження з Pixiv надішли це посилання в особистий чат із ботом.")
+        return
+    pixiv_auth.pending_urls[message.chat.id] = url
+    await message.answer(
+        "🔐 Для завантаження потрібен вхід у Pixiv. Натисни кнопку — я надішлю інструкцію українською.",
+        reply_markup=build_pixiv_login_keyboard(),
+    )
 
 
 def get_site_config(url: str):
@@ -306,6 +357,7 @@ def build_main_menu() -> InlineKeyboardMarkup:
 
 def build_service_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔐 Підключити Pixiv", callback_data="pixiv_login")],
         [InlineKeyboardButton(text="⬇️ Скачати JSON з історією", callback_data="export_history_json")],
         [InlineKeyboardButton(text="🧹 Очистити дублікати", callback_data="dedup_history")],
         [InlineKeyboardButton(text="💾 Вільне місце на диску", callback_data="disk_usage")],
@@ -1329,11 +1381,16 @@ async def run_download(message: types.Message, url: str, history_index: int, dow
     cfg = get_site_config(url)
     username = cfg.get("username")
     password = cfg.get("password")
+    pixiv_download = is_pixiv_url(url)
+    if pixiv_download and not pixiv_auth.has_token(message.chat.id):
+        db.update_history_entry(history_index, status="interrupted", auto_resume_at="", auto_resume_chat_id="")
+        await request_pixiv_login(message, url)
+        return
 
     download_dir.mkdir(parents=True, exist_ok=True)
 
     cmd = [
-        "gallery-dl",
+        sys.executable, "-m", "gallery_dl",
         "--dest", str(download_dir),
         "--filename", "{num:0>4}.{extension}",
         "--no-part",
@@ -1342,7 +1399,9 @@ async def run_download(message: types.Message, url: str, history_index: int, dow
         "--sleep",        str(CONFIG.get("gallery_dl_sleep", 1)),
         "--sleep-request", str(CONFIG.get("gallery_dl_sleep_request", 1)),
     ]
-    if username and password:
+    if pixiv_download:
+        cmd.extend(["--config", str(pixiv_auth.token_path(message.chat.id).resolve())])
+    elif username and password:
         cmd.extend(["--username", username, "--password", password])
     cookies_browser = CONFIG.get("gallery_dl_cookies_browser", "")
     if cookies_browser:
@@ -1489,6 +1548,11 @@ async def run_download(message: types.Message, url: str, history_index: int, dow
 
     full_output = "\n".join(output_lines)
     resume_url = extract_resume_url(full_output)
+    pixiv_auth_failed = pixiv_download and any(
+        "authenticationerror" in line.lower() for line in output_lines
+    )
+    if pixiv_auth_failed:
+        resume_url = None  # Authentication needs user input, not background retries.
     error_lines = [ln for ln in output_lines if _is_gallery_error_line(ln)]
     unsent_errors = [ln for ln in error_lines if ln not in sent_error_lines]
     if unsent_errors:
@@ -1526,6 +1590,10 @@ async def run_download(message: types.Message, url: str, history_index: int, dow
             retry_count=retry_count
         )
         cleanup_all_downloaded_images(archive_state)
+
+        if pixiv_auth_failed:
+            await request_pixiv_login(message, url)
+            return
 
         if gave_up:
             await message.answer(
@@ -1666,6 +1734,12 @@ def _find_active_history_entry_by_url(url: str) -> Optional[int]:
 
 
 async def handle_url(message: types.Message, url: str):
+    if is_pixiv_url(url) and not pixiv_auth.has_token(message.chat.id):
+        if message.chat.type == "private":
+            await start_pixiv_login(message, gallery_url=url)
+        else:
+            await request_pixiv_login(message, url)
+        return
     # Спочатку перевіряємо чи є незавершене завантаження
     active_index = _find_active_history_entry_by_url(url)
     if active_index is not None:
@@ -1680,6 +1754,11 @@ async def handle_url(message: types.Message, url: str):
                 f"📅 {entry['date']}\n\n"
                 f"Докачати з того самого місця?",
                 reply_markup=build_resume_keyboard(active_index)
+            )
+        elif status == "interrupted":
+            await message.answer(
+                "Попередня спроба перервалася без даних для докачки. Можна почати завантаження наново:",
+                reply_markup=build_redownload_keyboard(url),
             )
         else:
             await message.answer(
@@ -2374,6 +2453,74 @@ async def cmd_search(message: types.Message):
     PENDING_SEARCH_REQUESTS.add(message.from_user.id)
     PENDING_PARTIAL_REQUESTS.pop(message.from_user.id, None)
     await message.answer("🔎 Введи частину назви або частину посилання.", reply_markup=build_main_menu())
+
+
+@dp.message(Command("pixiv_login"))
+async def cmd_pixiv_login(message: types.Message):
+    await start_pixiv_login(message)
+
+
+@dp.callback_query(F.data == "pixiv_login")
+async def pixiv_login_callback(callback: types.CallbackQuery):
+    await callback.answer()
+    await start_pixiv_login(callback.message)
+
+
+@dp.callback_query(F.data == "pixiv_login_cancel")
+async def pixiv_login_cancel_callback(callback: types.CallbackQuery):
+    await callback.answer()
+    try:
+        pixiv_auth.cancel(callback.message.chat.id)
+    except PixivAuthError as e:
+        await callback.message.answer(str(e))
+        return
+    await callback.message.answer("Вхід у Pixiv скасовано.", reply_markup=build_main_menu())
+
+
+@dp.message(Command("cancel"), lambda message: message.chat.id in pixiv_auth.sessions
+            or message.chat.id in pixiv_auth.exchanging)
+async def cancel_pixiv_login(message: types.Message):
+    try:
+        pixiv_auth.cancel(message.chat.id)
+    except PixivAuthError as e:
+        await message.answer(str(e))
+        return
+    await message.answer("Вхід у Pixiv скасовано.", reply_markup=build_main_menu())
+
+
+# Register before URL/photo-selection handlers: a full callback URL is a code,
+# not a gallery URL. Authentication input never goes into download history.
+@dp.message(F.text, lambda message: message.chat.type == "private"
+            and (message.chat.id in pixiv_auth.sessions or message.chat.id in pixiv_auth.exchanging)
+            and not message.text.startswith("/"))
+async def receive_pixiv_code(message: types.Message):
+    try:
+        gallery_url = await pixiv_auth.finish(message.chat.id, message.text)
+    except PixivAuthError as e:
+        await message.answer(str(e), reply_markup=build_pixiv_login_keyboard())
+        return
+    finally:
+        try:
+            await message.delete()
+        except Exception:
+            pass  # Telegram may deny deletion; never log the authorization code.
+    await message.answer("✅ Pixiv підключено. Вхід збережено для цього особистого чату.")
+    if gallery_url:
+        await handle_url(message, gallery_url)
+    else:
+        await message.answer("Надішли посилання Pixiv для завантаження.", reply_markup=build_main_menu())
+
+
+@dp.message(F.text, lambda message: is_oauth_response(message.text))
+async def stale_pixiv_code(message: types.Message):
+    try:
+        await message.delete()
+    except Exception:
+        pass
+    await message.answer(
+        "Для цього коду немає активного входу. Натисни «Підключити Pixiv» та отримай новий код.",
+        reply_markup=build_pixiv_login_keyboard(),
+    )
 
 
 @dp.message(Command("history"))
