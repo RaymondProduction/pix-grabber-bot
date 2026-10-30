@@ -8,6 +8,7 @@ import signal
 import zipfile
 import shutil
 import sys
+import os
 from collections import deque
 from typing import Optional
 from types import SimpleNamespace
@@ -30,6 +31,7 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 import db
 from pixiv_auth import PixivAuth, PixivAuthError, is_oauth_response, is_pixiv_url
+from media_support import ANIMATION_EXTENSIONS, PIXIV_POSTPROCESSORS, DownloadActivity, probe_animation
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -60,10 +62,12 @@ queue_worker_started = False
 active_downloads = 0
 
 IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp'}
+MEDIA_EXTENSIONS = IMAGE_EXTENSIONS | ANIMATION_EXTENSIONS
 MAX_ARCHIVE_PART_SIZE = int(CONFIG.get("max_archive_part_size_mb", 45)) * 1024 * 1024
 ARCHIVE_FLUSH_RATIO = float(CONFIG.get("archive_flush_ratio", 0.90))
 ARCHIVE_FLUSH_SIZE = max(1, int(MAX_ARCHIVE_PART_SIZE * ARCHIVE_FLUSH_RATIO))
 STALL_TIMEOUT = int(CONFIG.get("stall_timeout_sec", 20))
+PIXIV_STALL_TIMEOUT = int(CONFIG.get("pixiv_stall_timeout_sec", 300))
 AUTO_RESUME_ENABLED = bool(CONFIG.get("auto_resume_enabled", True))
 AUTO_RESUME_RETRY_DELAYS = [5 * 60, 15 * 60, 40 * 60, 2 * 60 * 60, 4 * 60 * 60, 8 * 60 * 60]
 AUTO_RESUME_MAX_RETRIES = int(CONFIG.get("auto_resume_max_retries", len(AUTO_RESUME_RETRY_DELAYS)))
@@ -187,7 +191,7 @@ def get_image_refs_from_zip_parts(zip_parts: list[Path]) -> list[dict]:
     for zip_path in zip_parts:
         with zipfile.ZipFile(zip_path, 'r') as zf:
             for name in zf.namelist():
-                if Path(name).suffix.lower() in IMAGE_EXTENSIONS and not name.endswith('/'):
+                if Path(name).suffix.lower() in MEDIA_EXTENSIONS and not name.endswith('/'):
                     image_refs.append({"zip_path": str(zip_path), "image_name": name})
     return image_refs
 
@@ -196,7 +200,7 @@ def get_image_names_from_zip(zip_path: Path) -> list[str]:
     with zipfile.ZipFile(zip_path, 'r') as zf:
         return [
             name for name in zf.namelist()
-            if Path(name).suffix.lower() in IMAGE_EXTENSIONS and not name.endswith('/')
+            if Path(name).suffix.lower() in MEDIA_EXTENSIONS and not name.endswith('/')
         ]
 
 
@@ -261,7 +265,7 @@ def create_zip_file(zip_path: Path, images: list[Path]):
 
 
 def get_first_preview_image(images: list[Path]) -> Optional[Path]:
-    existing = [img for img in images if img.exists() and img.suffix.lower() in IMAGE_EXTENSIONS]
+    existing = [img for img in images if img.exists() and img.suffix.lower() in MEDIA_EXTENSIONS]
     return sorted(existing, key=lambda x: x.name.lower())[0] if existing else None
 
 
@@ -301,7 +305,7 @@ def get_gallery_folder_and_names(folder: Path) -> tuple[str, str]:
     for p in folder.rglob("*"):
         if p.is_dir():
             try:
-                if any(img.is_file() and img.suffix.lower() in IMAGE_EXTENSIONS for img in p.iterdir()):
+                if any(img.is_file() and img.suffix.lower() in MEDIA_EXTENSIONS for img in p.iterdir()):
                     gallery_folder = p
                     break
             except Exception:
@@ -311,9 +315,10 @@ def get_gallery_folder_and_names(folder: Path) -> tuple[str, str]:
     return gallery_name, safe_name
 
 
-def get_downloaded_images(folder: Path) -> list[Path]:
+def get_downloaded_images(folder: Path, include_animations: bool = True) -> list[Path]:
+    extensions = MEDIA_EXTENSIONS if include_animations else IMAGE_EXTENSIONS
     return sorted(
-        [f for f in folder.rglob("*.*") if f.is_file() and f.suffix.lower() in IMAGE_EXTENSIONS],
+        [f for f in folder.rglob("*.*") if f.is_file() and f.suffix.lower() in extensions],
         key=lambda x: x.stat().st_mtime
     )
 
@@ -385,7 +390,7 @@ def build_resume_keyboard(index: int) -> InlineKeyboardMarkup:
 def build_history_actions_keyboard(index: int, url: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📦 Переслати архів", callback_data=f"resend:{index}")],
-        [InlineKeyboardButton(text="🖼 Усі фото зі скачаного", callback_data=f"all_photos:{index}")],
+        [InlineKeyboardButton(text="🖼 Фото й анімації зі скачаного", callback_data=f"all_photos:{index}")],
         [InlineKeyboardButton(text="🔗 Отримати посилання", callback_data=f"get_url:{index}")],
         [InlineKeyboardButton(text="🗑 Видалити з історії", callback_data=f"delete_history_item:{index}")],
         [InlineKeyboardButton(text="⬅️ До історії", callback_data="show_history")]
@@ -481,7 +486,7 @@ async def forward_selected_images_from_history(
             logging.error(f"Не вдалося переслати фото з Telegram history: {e}")
             return False
 
-    await message.answer(f"✅ Відправлено {forwarded} фото з історії Telegram.", reply_markup=build_main_menu())
+    await message.answer(f"✅ Відправлено {forwarded} файлів з історії Telegram.", reply_markup=build_main_menu())
     return True
 
 
@@ -521,13 +526,16 @@ async def send_selected_images_from_refs(
     history_index: Optional[int] = None, webp_as_documents: bool = False
 ):
     selected_refs = [image_refs[i] for i in selected_indexes]
-    batch, batch_refs, sent_count, doc_count, opened_zips = [], [], 0, 0, {}
+    batch, batch_refs, sent_count, doc_count, animation_count, opened_zips = [], [], 0, 0, 0, {}
 
     async def flush_batch():
         nonlocal sent_count
         if not batch:
             return
-        sent_messages = await message.answer_media_group(batch)
+        if len(batch) == 1:
+            sent_messages = [await message.answer_photo(batch[0].media, caption=batch[0].caption)]
+        else:
+            sent_messages = await message.answer_media_group(batch)
         sent_count += len(batch)
         if history_index is not None:
             for sent_message, sent_ref in zip(sent_messages, batch_refs):
@@ -542,6 +550,17 @@ async def send_selected_images_from_refs(
                 opened_zips[zp] = zipfile.ZipFile(zp, 'r')
             data = opened_zips[zp].read(ref["image_name"])
             original_name = Path(ref["image_name"]).name
+
+            if Path(original_name).suffix.lower() in ANIMATION_EXTENSIONS:
+                await flush_batch()
+                sent_message = await message.answer_animation(
+                    types.BufferedInputFile(data, filename=original_name),
+                    caption=f"🎞 {html.escape(original_name)}",
+                )
+                animation_count += 1
+                if history_index is not None:
+                    append_image_message_to_history(history_index, Path(original_name), sent_message, kind="animation")
+                continue
 
             if webp_as_documents and original_name.lower().endswith('.webp'):
                 await flush_batch()
@@ -572,6 +591,8 @@ async def send_selected_images_from_refs(
         parts.append(f"{sent_count} фото")
     if doc_count:
         parts.append(f"{doc_count} документів (WebP)")
+    if animation_count:
+        parts.append(f"{animation_count} анімацій")
     await message.answer(f"✅ Відправлено {' і '.join(parts) if parts else '0 фото'}.", reply_markup=build_main_menu())
 
 
@@ -638,6 +659,13 @@ async def webp_choice_callback(callback: types.CallbackQuery):
     )
 
 
+async def send_media_preview(message, data: bytes, filename: str, caption: str):
+    if Path(filename).suffix.lower() in ANIMATION_EXTENSIONS:
+        return await message.answer_animation(types.BufferedInputFile(data, filename=filename), caption=caption)
+    data, filename = ensure_telegram_photo_compatible(data, filename)
+    return await message.answer_photo(types.BufferedInputFile(data, filename=filename), caption=caption)
+
+
 async def send_archive_preview(
     message: types.Message, preview_image: Optional[Path],
     gallery_name: str, image_count: int, history_index: int
@@ -660,13 +688,12 @@ async def send_archive_preview(
                     # Читаємо безпосередньо з ZIP
                     with zipfile.ZipFile(refs[0]["zip_path"], 'r') as zf:
                         data = zf.read(refs[0]["image_name"])
-                    data, photo_name = ensure_telegram_photo_compatible(data, Path(refs[0]["image_name"]).name)
-                    sent = await message.answer_photo(
-                        types.BufferedInputFile(data, filename=photo_name),
+                    sent = await send_media_preview(
+                        message, data, Path(refs[0]["image_name"]).name,
                         caption=(
                             f"🖼 Превʼю архіву\n"
                             f"Назва: {gallery_name}\n"
-                            f"Зображень: {image_count if image_count else 'рахується...'}"
+                            f"Файлів: {image_count if image_count else 'рахується...'}"
                         )
                     )
                     download_id = _get_download_id(history_index)
@@ -687,13 +714,12 @@ async def send_archive_preview(
 
     try:
         data = preview_image.read_bytes()
-        data, photo_name = ensure_telegram_photo_compatible(data, preview_image.name)
-        sent = await message.answer_photo(
-            types.BufferedInputFile(data, filename=photo_name),
+        sent = await send_media_preview(
+            message, data, preview_image.name,
             caption=(
                 f"🖼 Превʼю архіву\n"
                 f"Назва: {gallery_name}\n"
-                f"Зображень: {image_count if image_count else 'рахується...'}"
+                f"Файлів: {image_count if image_count else 'рахується...'}"
             )
         )
         download_id = _get_download_id(history_index)
@@ -741,14 +767,12 @@ async def send_history_item_preview(message: types.Message, index: int, entry: d
         first_ref = image_refs[0]
         with zipfile.ZipFile(first_ref["zip_path"], 'r') as zf:
             preview_data = zf.read(first_ref["image_name"])
-        preview_data, photo_name = ensure_telegram_photo_compatible(preview_data, Path(first_ref["image_name"]).name)
-
-        sent_preview = await message.answer_photo(
-            types.BufferedInputFile(preview_data, filename=photo_name),
+        sent_preview = await send_media_preview(
+            message, preview_data, Path(first_ref["image_name"]).name,
             caption=(
                 f"🖼 Превʼю архіву\n"
                 f"Назва: {entry['gallery_name']}\n"
-                f"Зображень: {entry['image_count']}"
+                f"Файлів: {entry['image_count']}"
             )
         )
         download_id = entry.get("_id")
@@ -836,11 +860,11 @@ async def send_single_archive_part(
 ):
     gallery_name = html.escape(gallery_name)
     if part_number == 1 and is_final_part:
-        caption = f"📦 Готово!\nЗображень: {image_count}\nНазва: {gallery_name}"
+        caption = f"📦 Готово!\nФайлів: {image_count}\nНазва: {gallery_name}"
     elif is_final_part:
-        caption = f"📦 Фінальна частина {part_number}\nЗображень у частині: {image_count}\nНазва: {gallery_name}"
+        caption = f"📦 Фінальна частина {part_number}\nФайлів у частині: {image_count}\nНазва: {gallery_name}"
     else:
-        caption = f"📦 Частина {part_number}\nЗображень у частині: {image_count}\nНазва: {gallery_name}"
+        caption = f"📦 Частина {part_number}\nФайлів у частині: {image_count}\nНазва: {gallery_name}"
 
     data = zip_path.read_bytes()
     sent = await message.answer_document(
@@ -914,10 +938,23 @@ async def send_live_downloaded_image(
     key = str(file_path)
     if key in state["live_sent_files"]:
         return
-    if not file_path.exists() or file_path.suffix.lower() not in IMAGE_EXTENSIONS:
+    if not file_path.exists() or file_path.suffix.lower() not in MEDIA_EXTENSIONS:
         return
     try:
         data = file_path.read_bytes()
+        if file_path.suffix.lower() in ANIMATION_EXTENSIONS:
+            sent = await message.answer_animation(
+                types.BufferedInputFile(data, filename=file_path.name), caption=f"🎞 {html.escape(file_path.name)}"
+            )
+            state["live_sent_files"].add(key)
+            if history_index is not None:
+                append_image_message_to_history(history_index, file_path, sent, kind="animation")
+                if not state.get("preview_sent"):
+                    download_id = _get_download_id(history_index)
+                    if download_id:
+                        db.set_preview_message(download_id, str(sent.chat.id), sent.message_id)
+                    state["preview_sent"] = True
+            return
         data, photo_name = ensure_telegram_photo_compatible(data, file_path.name)
         sent = await message.answer_photo(
             types.BufferedInputFile(data, filename=photo_name),
@@ -936,7 +973,9 @@ async def monitor_folder_and_send_archives(
     while True:
         await asyncio.sleep(2)
         try:
-            files = get_downloaded_images(folder)
+            # FFmpeg writes the final MP4 name before encoding is complete.
+            # Publish animations only after the subprocess exits and validation succeeds.
+            files = get_downloaded_images(folder, include_animations=False)
             new_images = []
 
             for file_path in files:
@@ -992,10 +1031,10 @@ async def finalize_streaming_archives(
     total_image_count = state["image_count"] + state.get("prev_image_count", 0)
     if total_image_count == 0:
         db.update_history_entry(
-            history_index, gallery_name="Зображень не знайдено", status="failed",
+            history_index, gallery_name="Файлів не знайдено", status="failed",
             image_count=0, resume_url="", auto_resume_at="", auto_resume_chat_id=""
         )
-        await message.answer("Не знайдено зображень для архіву.", reply_markup=build_main_menu())
+        await message.answer("Не знайдено зображень або анімацій для архіву.", reply_markup=build_main_menu())
         return
 
     gallery_name = state.get("gallery_name") or folder.name
@@ -1020,7 +1059,7 @@ async def finalize_streaming_archives(
     await message.answer(
         f"✅ Скачування завершено.\n"
         f"📦 Архівних частин (цей сеанс): {len(state['zip_paths'])}\n"
-        f"🖼 Зображень загалом: {total_image_count}{delivery_note}",
+        f"🖼 Файлів загалом: {total_image_count}{delivery_note}",
         reply_markup=build_main_menu()
     )
 
@@ -1196,9 +1235,14 @@ async def send_history_preview_images(message: types.Message, page_items: list[t
                     first_ref = refs[0]
                     with zipfile.ZipFile(first_ref["zip_path"], 'r') as zf:
                         preview_data = zf.read(first_ref["image_name"])
-                    preview_data, photo_name = ensure_telegram_photo_compatible(preview_data, Path(first_ref["image_name"]).name)
-                    media.append(types.InputMediaPhoto(
-                        media=types.BufferedInputFile(preview_data, filename=photo_name),
+                    preview_name = Path(first_ref["image_name"]).name
+                    if Path(preview_name).suffix.lower() in ANIMATION_EXTENSIONS:
+                        media_type = types.InputMediaVideo
+                    else:
+                        media_type = types.InputMediaPhoto
+                        preview_data, preview_name = ensure_telegram_photo_compatible(preview_data, preview_name)
+                    media.append(media_type(
+                        media=types.BufferedInputFile(preview_data, filename=preview_name),
                         caption=f"{real_index + 1}. {entry['gallery_name'][:80]}"
                     ))
                     preview_added = True
@@ -1217,7 +1261,12 @@ async def send_history_preview_images(message: types.Message, page_items: list[t
 
     for chunk_start in range(0, len(media), 10):
         try:
-            await message.answer_media_group(media[chunk_start:chunk_start + 10])
+            chunk = media[chunk_start:chunk_start + 10]
+            if len(chunk) == 1:
+                item = chunk[0]
+                await send_media_preview(message, item.media.data, item.media.filename, item.caption)
+            else:
+                await message.answer_media_group(chunk)
         except Exception as e:
             logging.error(f"Не вдалося відправити превʼю історії media group: {e}")
 
@@ -1351,7 +1400,7 @@ async def send_background_resume_item(message: types.Message, index: int, entry:
     lines = [f"{marker} <b>{html.escape(title[:80])}</b> (#{index + 1})"]
     if retry_line:
         lines.append(retry_line)
-    lines.append(f"🖼 Зображень: {entry.get('image_count', 0)}")
+    lines.append(f"🖼 Файлів: {entry.get('image_count', 0)}")
     lines.append(f"📅 {entry.get('date', '')}")
     lines.append(f"🔗 {entry.get('url', '')}")
 
@@ -1435,6 +1484,7 @@ async def run_download(message: types.Message, url: str, history_index: int, dow
     ]
     if pixiv_download:
         cmd.extend(["--config", str(pixiv_auth.token_path(message.chat.id).resolve())])
+        cmd.extend(["-o", "extractor.pixiv.ugoira=true", "-o", "postprocessors=" + json.dumps(PIXIV_POSTPROCESSORS)])
     elif username and password:
         cmd.extend(["--username", username, "--password", password])
     cookies_browser = CONFIG.get("gallery_dl_cookies_browser", "")
@@ -1449,10 +1499,13 @@ async def run_download(message: types.Message, url: str, history_index: int, dow
     process = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE
+        stderr=asyncio.subprocess.PIPE,
+        start_new_session=(os.name == "posix"),
     )
 
     loop = asyncio.get_running_loop()
+    activity = DownloadActivity(loop.time())
+    stall_timeout = PIXIV_STALL_TIMEOUT if pixiv_download else STALL_TIMEOUT
 
     # Підтягуємо кількість зображень з попередніх сеансів докачки
     prev_entry = db.load_history()
@@ -1508,6 +1561,7 @@ async def run_download(message: types.Message, url: str, history_index: int, dow
             if not decoded:
                 continue
             tagged = f"[{stream_name}] {decoded}"
+            activity.touch(loop.time())
             output_lines.append(tagged)
             logging.info(f"[gallery-dl] {tagged}")
             if _is_gallery_error_line(decoded) and tagged not in sent_error_lines:
@@ -1525,7 +1579,10 @@ async def run_download(message: types.Message, url: str, history_index: int, dow
         if process.returncode is not None:
             return
         try:
-            process.send_signal(signal.SIGINT)
+            if os.name == "posix":
+                os.killpg(process.pid, signal.SIGINT)
+            else:
+                process.send_signal(signal.SIGINT)
         except ProcessLookupError:
             return
         except Exception as e:
@@ -1536,7 +1593,11 @@ async def run_download(message: types.Message, url: str, history_index: int, dow
         except asyncio.TimeoutError:
             logging.warning("[watchdog] kill після таймауту SIGINT")
             try:
-                process.kill()
+                if os.name == "posix":
+                    os.killpg(process.pid, signal.SIGKILL)
+                else:
+                    process.kill()
+                await process.wait()
             except Exception:
                 pass
 
@@ -1544,15 +1605,12 @@ async def run_download(message: types.Message, url: str, history_index: int, dow
         nonlocal stall_triggered
         while process.returncode is None:
             await asyncio.sleep(1)
-            elapsed = loop.time() - archive_state.get("last_image_at", loop.time())
-            if elapsed < STALL_TIMEOUT:
+            if not activity.stalled(download_dir, loop.time(), stall_timeout):
                 continue
-            logging.warning(f"[watchdog] Немає нових картинок {STALL_TIMEOUT}с — SIGINT")
+            logging.warning(f"[watchdog] Немає активності завантаження {stall_timeout}с — SIGINT")
             stall_triggered = True
-            await message.answer(
-                f"⏱ Нова картинка не зʼявлялась більше {STALL_TIMEOUT} сек — роблю Ctrl+C."
-            )
             await _stop_process_by_interrupt()
+            await message.answer(f"⏱ Завантаження або конвертація не просувається понад {stall_timeout} сек — зупинив спробу.")
             return
 
     monitor_task = asyncio.create_task(monitor_folder_and_send_archives(download_dir, message, history_index, archive_state))
@@ -1580,6 +1638,21 @@ async def run_download(message: types.Message, url: str, history_index: int, dow
             stdout_task.cancel()
             stderr_task.cancel()
 
+    animation_failed = False
+    for path in get_downloaded_images(download_dir):
+        if path.suffix.lower() not in ANIMATION_EXTENSIONS:
+            continue
+        try:
+            await probe_animation(path)
+        except (OSError, ValueError, asyncio.TimeoutError):
+            animation_failed = True
+            path.rename(make_unique_path(path.with_suffix(".mp4.failed")))
+            logging.warning("Незавершену анімацію %s збережено для повторної обробки", path.name)
+    if any("ugoira][error]" in line.lower() for line in output_lines):
+        animation_failed = True
+    if animation_failed:
+        await message.answer("⚠️ Не вдалося завершити конвертацію анімації. Вихідні файли збережені на сервері.")
+
     full_output = "\n".join(output_lines)
     resume_url = extract_resume_url(full_output)
     pixiv_auth_failed = pixiv_download and any(
@@ -1594,7 +1667,7 @@ async def run_download(message: types.Message, url: str, history_index: int, dow
     if stall_triggered:
         await _send_gallery_log(output_lines, title="📋 <b>Останній лог gallery-dl перед зупинкою:</b>")
 
-    interrupted = (process.returncode != 0) or resume_url or stall_triggered
+    interrupted = (process.returncode != 0) or resume_url or stall_triggered or animation_failed
 
     if interrupted:
         await flush_remaining_downloaded_images(download_dir, message, history_index, archive_state)
@@ -1633,7 +1706,7 @@ async def run_download(message: types.Message, url: str, history_index: int, dow
             await message.answer(
                 f"🚫 Зупинив спроби докачки після {retry_count}.\n"
                 f"📁 <b>{archive_state.get('gallery_name') or 'Без назви'}</b>\n"
-                f"🖼 Збережено: {total_image_count} зображень\n\n"
+                f"🖼 Збережено: {total_image_count} файлів\n\n"
                 f"Схоже, сторінка більше недоступна (можливо, контент видалили).\n"
                 f"Позначив запис як \"не вдалося завантажити\" — більше не намагатимусь автоматично.\n"
                 f"За потреби можна скачати наново з історії.",
@@ -1645,7 +1718,7 @@ async def run_download(message: types.Message, url: str, history_index: int, dow
         await message.answer(
             f"⚠️ Скачування перервано або неповне.\n"
             f"📦 Архівних частин (цей сеанс): {len(archive_state['zip_paths'])}\n"
-            f"🖼 Зображень загалом: {total_image_count}"
+            f"🖼 Файлів загалом: {total_image_count}"
             f"{resume_text}"
         )
         if resume_url:
@@ -1671,6 +1744,9 @@ class ChatMessageProxy:
 
     async def answer_photo(self, photo, **kwargs):
         return await bot.send_photo(self.chat.id, photo=photo, **kwargs)
+
+    async def answer_animation(self, animation, **kwargs):
+        return await bot.send_animation(self.chat.id, animation=animation, **kwargs)
 
     async def answer_document(self, document, **kwargs):
         return await bot.send_document(self.chat.id, document=document, **kwargs)
@@ -1792,7 +1868,7 @@ async def handle_url(message: types.Message, url: str):
             await message.answer(
                 f"⏸ Це посилання вже є в історії — скачування було перерване.\n\n"
                 f"📁 <b>{entry['gallery_name']}</b>\n"
-                f"🖼 Збережено: {entry['image_count']} зображень\n"
+                f"🖼 Збережено: {entry['image_count']} файлів\n"
                 f"📅 {entry['date']}\n\n"
                 f"Докачати з того самого місця?",
                 reply_markup=build_resume_keyboard(active_index)
@@ -1818,7 +1894,7 @@ async def handle_url(message: types.Message, url: str):
         await message.answer(
             f"♻️ Це посилання вже є в історії і архів уже скачано.\n\n"
             f"📁 <b>{entry['gallery_name']}</b>\n"
-            f"🖼 Зображень: {entry['image_count']}\n"
+            f"🖼 Файлів: {entry['image_count']}\n"
             f"📅 {entry['date']}\n\n"
             f"Відправляю готовий архів з історії."
         )
@@ -1876,10 +1952,9 @@ async def send_existing_archive_from_history(message: types.Message, index: int)
             if refs:
                 with zipfile.ZipFile(refs[0]["zip_path"], 'r') as zf:
                     prev_data = zf.read(refs[0]["image_name"])
-                prev_data, photo_name = ensure_telegram_photo_compatible(prev_data, Path(refs[0]["image_name"]).name)
-                sent_prev = await message.answer_photo(
-                    types.BufferedInputFile(prev_data, filename=photo_name),
-                    caption=f"🖼 Превʼю архіву\nНазва: {entry['gallery_name']}\nЗображень: {entry['image_count']}"
+                sent_prev = await send_media_preview(
+                    message, prev_data, Path(refs[0]["image_name"]).name,
+                    caption=f"🖼 Превʼю архіву\nНазва: {entry['gallery_name']}\nФайлів: {entry['image_count']}"
                 )
                 download_id = entry.get("_id")
                 if download_id:
@@ -1915,9 +1990,9 @@ async def send_existing_archive_from_history(message: types.Message, index: int)
     total_parts = len(existing)
     for part_number, zip_path in enumerate(existing, start=1):
         caption = (
-            f"📦 {entry['gallery_name']}\n🖼 {entry['image_count']} зображень\n📅 {entry['date']}\n🔗 {entry['url']}"
+            f"📦 {entry['gallery_name']}\n🖼 {entry['image_count']} файлів\n📅 {entry['date']}\n🔗 {entry['url']}"
             if total_parts == 1 else
-            f"📦 {entry['gallery_name']} — частина {part_number}/{total_parts}\n🖼 {entry['image_count']} зображень загалом\n📅 {entry['date']}\n🔗 {entry['url']}"
+            f"📦 {entry['gallery_name']} — частина {part_number}/{total_parts}\n🖼 {entry['image_count']} файлів загалом\n📅 {entry['date']}\n🔗 {entry['url']}"
         )
         data = zip_path.read_bytes()
         sent = await message.answer_document(
@@ -2165,12 +2240,12 @@ async def history_item_callback(callback: types.CallbackQuery):
         if partial_request:
             PENDING_PARTIAL_REQUESTS[callback.from_user.id] = partial_request
             partial_text = (
-                "\n\n🖼 Можеш одразу написати номери фото або діапазон.\n"
+                "\n\n🖼 Можеш одразу написати номери файлів або діапазон.\n"
                 "Приклади: <code>1-5</code>, <code>1,3,7</code>, <code>2-4,8</code>"
             )
         await callback.message.answer(
             f"⏸ <b>{entry['gallery_name']}</b>\n"
-            f"🖼 Збережено: {entry['image_count']} зображень\n"
+            f"🖼 Збережено: {entry['image_count']} файлів\n"
             f"📅 {entry['date']}\n"
             f"🔗 {entry['url']}"
             f"{partial_text}",
@@ -2185,17 +2260,17 @@ async def history_item_callback(callback: types.CallbackQuery):
         if partial_request:
             PENDING_PARTIAL_REQUESTS[callback.from_user.id] = partial_request
             partial_text = (
-                "\n\n🖼 Можеш одразу написати номери фото або діапазон.\n"
+                "\n\n🖼 Можеш одразу написати номери файлів або діапазон.\n"
                 "Приклади: <code>1-5</code>, <code>1,3,7</code>, <code>2-4,8</code>"
             )
         await callback.message.answer(
             f"🟡 <b>{entry['gallery_name']}</b>\n"
-            f"🖼 Завантажено: {entry['image_count']} зображень\n"
+            f"🖼 Завантажено: {entry['image_count']} файлів\n"
             f"📅 {entry['date']}\n"
             f"🔗 {entry['url']}"
             f"{partial_text}",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🖼 Переслати частину фото", callback_data=f"partial:{index}")],
+                [InlineKeyboardButton(text="🖼 Переслати вибрані файли", callback_data=f"partial:{index}")],
                 [InlineKeyboardButton(text="🗑 Видалити з історії", callback_data=f"delete_history_item:{index}")],
                 [InlineKeyboardButton(text="⬅️ До історії", callback_data="show_history")]
             ])
@@ -2221,13 +2296,13 @@ async def history_item_callback(callback: types.CallbackQuery):
     if partial_request:
         PENDING_PARTIAL_REQUESTS[callback.from_user.id] = partial_request
         partial_text = (
-            "\n\n🖼 Можеш одразу написати номери фото або діапазон.\n"
+            "\n\n🖼 Можеш одразу написати номери файлів або діапазон.\n"
             "Приклади: <code>1-5</code>, <code>1,3,7</code>, <code>2-4,8</code>"
         )
 
     await callback.message.answer(
         f"📁 <b>{entry['gallery_name']}</b>\n"
-        f"🖼 Зображень: {entry['image_count']}\n"
+        f"🖼 Файлів: {entry['image_count']}\n"
         f"📅 {entry['date']}\n"
         f"🔗 {entry['url']}"
         f"{partial_text}",
@@ -2338,7 +2413,7 @@ async def all_photos_callback(callback: types.CallbackQuery):
     if existing_zips:
         image_refs = get_image_refs_from_zip_parts(existing_zips)
         if not refs_have_webp(image_refs, selected_indexes):
-            selected_messages = find_image_messages_for_refs(image_refs, selected_indexes, image_messages, kind="photo")
+            selected_messages = find_image_messages_for_refs(image_refs, selected_indexes, image_messages, kind=None)
             if selected_messages and await forward_selected_images_from_history(selected_messages, list(range(len(selected_messages))), callback.message):
                 return
 
@@ -2411,10 +2486,10 @@ async def partial_resend_request(callback: types.CallbackQuery):
     await callback.answer()
     await callback.message.answer(
         f"🖼 <b>{entry['gallery_name']}</b>\n"
-        f"В архіві <b>{image_count}</b> фото.\n\n"
-        f"Надішли номери фото або діапазон.\n"
+        f"В архіві <b>{image_count}</b> файлів.\n\n"
+        f"Надішли номери файлів або діапазон.\n"
         f"Приклади: <code>1-5</code>, <code>1,3,7</code>, <code>2-4,8</code>\n\n"
-        f"Перші {preview_count} фото:\n" + "\n".join(preview_lines)
+        f"Перші {preview_count} файлів:\n" + "\n".join(preview_lines)
     )
 
 
@@ -2656,7 +2731,7 @@ async def handle_partial_selection(message: types.Message):
         if existing_zips:
             image_refs = get_image_refs_from_zip_parts(existing_zips)
             if not refs_have_webp(image_refs, selected_indexes):
-                selected_messages = find_image_messages_for_refs(image_refs, selected_indexes, image_messages, kind="photo")
+                selected_messages = find_image_messages_for_refs(image_refs, selected_indexes, image_messages, kind=None)
                 if selected_messages and await forward_selected_images_from_history(selected_messages, list(range(len(selected_messages))), message):
                     return
 

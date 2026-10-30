@@ -4,6 +4,7 @@ Telegram bot for downloading galleries using **gallery-dl** with automatic archi
 
 ## Features
 - Download images from web sites
+- Convert Pixiv Ugoira animations to MP4 and send them as Telegram animations
 - Two modes: real-time (one by one) and fast (all at once)
 - Automatic ZIP archive creation with meaningful filename
 - Download history with easy re-send
@@ -74,6 +75,16 @@ Use **/history** to see previous downloads and re-send archives
 ```bash
 python -m unittest discover -s tests -v
 ```
+
+### Анімації Pixiv (Ugoira)
+
+Бот завантажує ZIP із кадрами та перетворює його на MP4 (H.264 без звуку) через FFmpeg.
+Готова анімація надсилається в Telegram, потрапляє в ZIP-архів та доступна для повторного надсилання з історії.
+Одна анімація рахується як один файл. Незавершені MP4 не надсилаються; при помилці конвертації джерело залишається на сервері.
+
+На сервері потрібні `ffmpeg` і `ffprobe` у `PATH` (Debian/Ubuntu: `sudo apt install ffmpeg`).
+Для Pixiv таймаут без активності за замовчуванням становить 300 секунд; його можна змінити через `pixiv_stall_timeout_sec` у `config.json`.
+Перевірка враховує зміну розміру тимчасових файлів і активність конвертації. Загальний ліміт однієї спроби — 30 хвилин.
 
 ### Configuration
 Edit config.json:
