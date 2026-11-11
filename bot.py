@@ -2973,13 +2973,16 @@ async def start_video_login(message, platform: str):
     await message.answer(
         f"🔐 <b>Підключення {PLATFORMS[platform]}</b>\n\n"
         f"1. Увійди на <b>{platform}.com</b> у своєму браузері.\n"
-        "2. Експортуй cookies цього сайту у текстовому форматі <b>Netscape</b>.\n"
+        "2. Експортуй cookies цього сайту у текстовому форматі <b>Netscape</b>. "
+        "Для цього зручно скористатися, наприклад, розширенням "
+        '<a href="https://chromewebstore.google.com/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc">'
+        "Get cookies.txt LOCALLY</a> для Chrome.\n"
         "3. Надішли файл <code>cookies.txt</code> сюди як документ (до 256 КіБ).\n\n"
         "Cookies дають доступ до твого акаунта — це приватний файл. "
         "Бот збереже лише cookies обраного сайту для цього особистого чату "
         "і спробує видалити повідомлення з файлом. Пароль не потрібен.\n"
         "Після збереження cookies невдалі відео цього сервісу з історії автоматично повернуться в чергу.\n"
-        "Скасувати: /cancel.")
+        "Скасувати: /cancel.", link_preview_options=types.LinkPreviewOptions(is_disabled=True))
 
 
 @dp.message(Command("facebook_login", "instagram_login", "tiktok_login", "youtube_login"))

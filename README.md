@@ -86,6 +86,9 @@ Use **/history** to see previous downloads and re-send archives
 
 1. Увійдіть на потрібний сайт у браузері.
 2. Експортуйте cookies цього сайту в текстовому форматі **Netscape**.
+   Для цього зручно скористатися, наприклад, розширенням
+   [Get cookies.txt LOCALLY](https://chromewebstore.google.com/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc)
+   для Chrome.
 3. Після команди підключення надішліть файл боту як документ, до 256 КіБ.
 4. Після збереження cookies бот **автоматично поверне невдалі відео цього сервісу в чергу**
    й повідомить їхню кількість. Для ще не запущених посилань залишається `/grab_pending`.
