@@ -180,6 +180,16 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(request.call_args_list[0].args[0]["pagelist"], [[42, "abc", 1]])
         self.assertEqual({a["name"] for _, authors, _ in results for a in authors}, {"one", "two"})
 
+    def test_old_pasted_urls_use_the_same_leading_gallery_as_the_downloader(self):
+        entries = [{"url": "https://e-hentai.org/g/42/abc/)"},
+                   {"url": "https://e-hentai.org/g/42/abc/https://e-hentai.org/g/43/def/"}]
+        reply = {"gmetadata": [{"gid": 42, "tags": ["artist:one"]}]}
+        with patch.object(migration, "eh_request", return_value=reply) as request, patch.object(migration.time, "sleep"):
+            results = list(migration.eh_batches(entries))[0]
+        self.assertEqual(len(results), 2)
+        self.assertEqual(request.call_args.args[0]["gidlist"], [(42, "abc")])
+        self.assertTrue(all(authors[0]["name"] == "one" for _, authors, _ in results))
+
 
 class VideoAuthorTests(unittest.IsolatedAsyncioTestCase):
     async def test_author_is_retained_even_if_download_fails_after_metadata(self):

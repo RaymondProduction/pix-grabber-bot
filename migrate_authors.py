@@ -108,8 +108,10 @@ def eh_batches(entries):
     pages = []
     for entry in entries:
         path = urlsplit(entry["url"]).path
-        gallery = re.fullmatch(r"/g/(\d+)/([a-fA-F0-9]+)/?", path)
-        page = re.fullmatch(r"/s/([a-fA-F0-9]+)/(\d+)-(\d+)/?", path)
+        # Historical input sometimes contains a repeated URL or text after the
+        # final slash. Match the leading gallery like gallery-dl itself does.
+        gallery = re.match(r"^/g/(\d+)/([a-fA-F0-9]+)(?:/|$)", path)
+        page = re.match(r"^/s/([a-fA-F0-9]+)/(\d+)-(\d+)(?:/|$)", path)
         if gallery:
             key = (int(gallery[1]), gallery[2])
             galleries.setdefault(key, []).append(entry)
