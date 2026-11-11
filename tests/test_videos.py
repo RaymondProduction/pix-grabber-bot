@@ -27,11 +27,13 @@ from test_pixiv_auth import RecordingSession
 
 ROOT = Path(__file__).resolve().parents[1]
 URLS = ["https://www.facebook.com/reel/123", "https://www.instagram.com/reel/abc/",
-        "https://www.tiktok.com/@test/video/123"]
+        "https://www.tiktok.com/@test/video/123",
+        "https://youtube.com/shorts/pHofASeGcds?si=We57kcQUClqtbdMX"]
 
 
 def cookies(platform="facebook", expiry="0"):
-    names = {"facebook": ["c_user", "xs"], "instagram": ["sessionid"], "tiktok": ["sid_tt"]}[platform]
+    names = {"facebook": ["c_user", "xs"], "instagram": ["sessionid"], "tiktok": ["sid_tt"],
+             "youtube": ["SAPISID"]}[platform]
     return ("# Netscape HTTP Cookie File\n" + "".join(
         f".{platform}.com\tTRUE\t/\tTRUE\t{expiry}\t{name}\tsynthetic-{name}\n"
         for name in names)).encode()
@@ -82,6 +84,15 @@ class CookieTests(unittest.TestCase):
         jar.load()
         self.assertEqual({c.name for c in jar}, {"c_user", "xs"})
 
+    def test_youtube_accepts_secure_session_and_filters_google_cookies(self):
+        raw = cookies("youtube").replace(b"SAPISID", b"__Secure-3PAPISID")
+        raw += b".google.com\tTRUE\t/\tTRUE\t0\tSAPISID\tprivate-google-cookie\n"
+        self.auth.save(123, "youtube", raw)
+        self.assertIn(b"__Secure-3PAPISID", self.auth.read(123, "youtube"))
+        self.assertNotIn(b"google.com", self.auth.read(123, "youtube"))
+        with self.assertRaises(auth.VideoAuthError):
+            self.auth.save(123, "youtube", cookies("youtube").replace(b"SAPISID", b"VISITOR_INFO1_LIVE"))
+
 
 class ErrorClassificationTests(unittest.TestCase):
     def test_ambiguous_site_failures_offer_login_without_claiming_it_is_required(self):
@@ -110,7 +121,7 @@ class ErrorClassificationTests(unittest.TestCase):
 
 class RoutingStorageTests(unittest.TestCase):
     def test_platforms_short_links_and_spoofed_domains(self):
-        for url, expected in zip(URLS, ("facebook", "instagram", "tiktok")):
+        for url, expected in zip(URLS, ("facebook", "instagram", "tiktok", "youtube")):
             self.assertEqual(video.video_platform(url), expected)
         for url in ("https://fb.watch/abc", "https://m.facebook.com/watch/?v=123",
                     "https://www.facebook.com/share/r/abc"):
@@ -124,6 +135,30 @@ class RoutingStorageTests(unittest.TestCase):
         for url in ("https://www.facebook.com/photos/123", "https://www.facebook.com/photo.php?fbid=123",
                     "https://www.tiktok.com/@test/photo/123"):
             self.assertIsNone(video.video_platform(url))
+
+    def test_youtube_direct_urls_exclude_playlists_redirects_and_spoofed_hosts(self):
+        for url in (URLS[3], "https://youtu.be/pHofASeGcds?si=share",
+                    "https://m.youtube.com/watch?v=pHofASeGcds&list=playlist",
+                    "https://www.youtube.com/live/pHofASeGcds",
+                    "https://www.youtube-nocookie.com/embed/pHofASeGcds"):
+            self.assertEqual(video.video_platform(url), "youtube")
+        for url in ("https://youtube.com.evil.test/shorts/pHofASeGcds",
+                    "https://youtube.com/playlist?list=playlist", "https://youtube.com/@channel",
+                    "https://youtube.com/redirect?q=https://example.test", "https://youtu.be/",
+                    "https://youtube.com/watch?v=invalid", "https://youtu.be:8080/pHofASeGcds"):
+            self.assertIsNone(video.video_platform(url))
+
+    def test_youtube_uses_explicit_deno_and_reports_missing_runtime_without_login_prompt(self):
+        from yt_dlp import parse_options
+        with patch.object(video.shutil, "which", return_value="/runtime/deno"):
+            options = parse_options(video.download_command(URLS[3], Path("output"), None, 1024)[3:]).ydl_opts
+        self.assertEqual(options["js_runtimes"]["deno"]["path"], "/runtime/deno")
+        self.assertEqual(options["format_sort"], ["res:720"])
+        with patch.object(video.shutil, "which", return_value=None):
+            with self.assertRaises(video.VideoDownloadError) as raised:
+                video.download_command(URLS[3], Path("output"), None, 1024)
+        self.assertIn("Deno", str(raised.exception))
+        self.assertFalse(raised.exception.suggest_login)
 
     def test_symlink_storage_and_unavailable_ssd(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -372,7 +407,7 @@ class VideoBotTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn(self.ssd.resolve(), folder.resolve().parents)
             self.module.cleanup_download_folder(folder)
             self.assertTrue((folder / "clip.mp4").exists())
-        self.assertEqual(self.message.answer_video.await_count, 3)
+        self.assertEqual(self.message.answer_video.await_count, len(URLS))
         self.message.answer_document.assert_not_awaited()
         self.message.answer_animation.assert_not_awaited()
         self.assertFalse(list(self.ssd.rglob("*.zip")))
@@ -670,6 +705,54 @@ class VideoBotTests(unittest.IsolatedAsyncioTestCase):
         _, _, download_id, folder = self.module.get_download_queue().get_nowait()
         self.assertEqual(folder, self.module.VIDEO_DOWNLOAD_DIR / "facebook" / "123" / f"retry_{download_id}")
         self.assertEqual(db.load_history()[index]["download_dir"], str(folder))
+
+    async def test_legacy_youtube_recovery_preserves_id_owner_and_uses_ssd(self):
+        index = db.add_history_entry(URLS[3], "images/old-youtube")
+        download_id = db.find_download_id_by_index(index)
+        db.update_history_entry(index, status="interrupted", resume_url=URLS[3],
+                                auto_resume_chat_id="123", auto_resume_at="2099-01-01 00:00:00")
+        self.module.recover_legacy_youtube_downloads()
+        self.module.recover_legacy_youtube_downloads()
+        entry = db.load_history()[index]
+        self.assertEqual((entry["_id"], entry["media_kind"], entry["owner_chat_id"], entry["status"]),
+                         (download_id, "video", "123", "interrupted"))
+        self.assertEqual(entry["auto_resume_at"], "")
+        self.assertIn(self.ssd.resolve(), Path(entry["download_dir"]).resolve().parents)
+        self.assertFalse(self.module.can_access_entry(entry, 456))
+        self.module.video_auth.save(123, "youtube", cookies("youtube"))
+        self.assertEqual(self.module.enqueue_failed_videos(123, "youtube"), 1)
+        self.assertEqual(self.module.get_download_queue().get_nowait()[2], download_id)
+
+    async def test_legacy_recovery_skips_unknown_owner_completed_and_nonempty_galleries(self):
+        for updates in ({}, {"image_count": 1}, {"status": "done"}, {"zip_parts": ["images/archive.zip"]}):
+            index = db.add_history_entry(URLS[3], "images/old-youtube")
+            values = {"status": "interrupted", "auto_resume_chat_id": "123" if updates else ""}
+            db.update_history_entry(index, **(values | updates))
+        gallery = db.add_history_entry(URLS[1], "images/instagram-photos")
+        db.update_history_entry(gallery, status="interrupted", auto_resume_chat_id="123")
+        self.module.recover_legacy_youtube_downloads()
+        self.assertTrue(all(entry["media_kind"] == "gallery" for entry in db.load_history()))
+
+    async def test_legacy_manual_resume_routes_youtube_to_video_storage(self):
+        old_folder = self.root / "old-images-on-sd"
+        index = db.add_history_entry(URLS[3], str(old_folder))
+        with patch.object(self.module, "download_video", AsyncMock(side_effect=self.completed_download)), \
+                patch.object(self.module.shutil, "which", return_value="/usr/bin/ffmpeg"), \
+                patch.object(self.module, "run_gallery_download", AsyncMock()) as gallery:
+            await self.module.run_download(self.message, URLS[3], index, old_folder)
+        gallery.assert_not_awaited()
+        entry = db.load_history()[index]
+        self.assertEqual(entry["status"], "done")
+        self.assertIn(self.ssd.resolve(), Path(entry["download_dir"]).resolve().parents)
+        self.assertFalse(old_folder.exists())
+
+    async def test_youtube_login_command_is_registered(self):
+        self.module.bot.session = RecordingSession()
+        user = User(id=123, is_bot=False, first_name="User")
+        message = Message(message_id=1, date=datetime.now(timezone.utc),
+                          chat=Chat(id=123, type="private"), from_user=user, text="/youtube_login")
+        await self.module.dp.feed_update(self.module.bot, Update(update_id=1, message=message))
+        self.assertEqual(self.module.video_auth.pending[123], "youtube")
 
     async def test_schema_v5_upgrade_preserves_history(self):
         # Simulate the production schema before the new columns existed.

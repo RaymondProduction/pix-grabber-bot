@@ -4,11 +4,13 @@ import asyncio
 import contextlib
 import json
 import os
+import re
 import signal
+import shutil
 import sys
 import tempfile
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from media_support import DownloadActivity
 
@@ -64,6 +66,17 @@ def video_platform(url: str) -> str | None:
         if (parsed.scheme not in ("https", "http") or parsed.username or parsed.password
                 or parsed.port not in (None, 80, 443) or any(ord(c) < 33 for c in url)):
             return None
+        if host in ("youtu.be", "www.youtu.be"):
+            if re.fullmatch(r"/[\w-]{11}/?", parsed.path, re.ASCII):
+                return "youtube"
+        if host == "youtube.com" or host.endswith(".youtube.com"):
+            if (re.fullmatch(r"/(?:shorts|live|embed|v)/[\w-]{11}/?", parsed.path, re.ASCII)
+                    or (parsed.path.rstrip("/") == "/watch"
+                        and re.fullmatch(r"[\w-]{11}", parse_qs(parsed.query).get("v", [""])[0], re.ASCII))):
+                return "youtube"
+        if host in ("youtube-nocookie.com", "www.youtube-nocookie.com"):
+            if re.fullmatch(r"/embed/[\w-]{11}/?", parsed.path, re.ASCII):
+                return "youtube"
         for platform in ("facebook", "instagram", "tiktok"):
             root = platform + ".com"
             if host == root or host.endswith("." + root):
@@ -118,17 +131,23 @@ def save_video(folder: Path, item: dict):
 
 
 def download_command(url: str, folder: Path, cookies: Path | None, max_bytes: int) -> list[str]:
-    if not video_platform(url):
+    platform = video_platform(url)
+    if not platform:
         raise VideoDownloadError("Непідтримуване посилання на відео.")
     args = [sys.executable, "-m", "yt_dlp", "--ignore-config", "--no-plugin-dirs",
             "--no-cache-dir", "--no-progress", "--no-warnings", "--no-simulate",
             "--no-playlist", "--playlist-end", "10", "--socket-timeout", "30",
             "--retries", "2", "--fragment-retries", "2", "--max-filesize", str(max_bytes),
             "--restrict-filenames", "--no-overwrites", "-P", str(folder.resolve()),
-            "-o", "%(id)s_%(title).80B.%(ext)s", "-S", "res:1080",
+            "-o", "%(id)s_%(title).80B.%(ext)s", "-S", "res:720" if platform == "youtube" else "res:1080",
             "-f", "bv*[vcodec^=avc1][ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b",
             "--merge-output-format", "mp4/mkv",
             "--print", 'after_move:%(.{filepath,title,id,duration,width,height})j']
+    if platform == "youtube":
+        deno = shutil.which("deno")
+        if not deno:
+            raise VideoDownloadError("На сервері потрібен Deno для завантаження YouTube. Повідом адміністратора бота.")
+        args += ["--js-runtimes", f"deno:{deno}"]
     if cookies:
         args += ["--cookies", str(cookies)]
     return args + ["--", url]

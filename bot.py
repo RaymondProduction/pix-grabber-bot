@@ -377,7 +377,7 @@ def build_main_menu() -> InlineKeyboardMarkup:
 def build_service_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔐 Підключити Pixiv", callback_data="pixiv_login")],
-        [InlineKeyboardButton(text="🎬 Facebook / Instagram / TikTok", callback_data="video_accounts")],
+        [InlineKeyboardButton(text="🎬 Акаунти відеосервісів", callback_data="video_accounts")],
         [InlineKeyboardButton(text="⬇️ Скачати JSON з історією", callback_data="export_history_json")],
         [InlineKeyboardButton(text="🧹 Очистити дублікати", callback_data="dedup_history")],
         [InlineKeyboardButton(text="💾 Вільне місце на диску", callback_data="disk_usage")],
@@ -1706,7 +1706,12 @@ def schedule_entry_for_background_resume(index: int, entry: dict, chat_id: int) 
 
 
 async def run_download(message: types.Message, url: str, history_index: int, download_dir: Path):
-    if video_platform(url):
+    platform = video_platform(url)
+    if platform:
+        entry = db.load_history()[history_index]
+        if entry.get("media_kind") != "video":
+            # Older versions sent YouTube to gallery-dl and used the images directory.
+            download_dir = VIDEO_DOWNLOAD_DIR / platform / str(message.chat.id) / f"retry_{entry['_id']}"
         return await run_video_download(message, url, history_index, download_dir)
     return await run_gallery_download(message, url, history_index, download_dir)
 
@@ -2977,7 +2982,7 @@ async def start_video_login(message, platform: str):
         "Скасувати: /cancel.")
 
 
-@dp.message(Command("facebook_login", "instagram_login", "tiktok_login"))
+@dp.message(Command("facebook_login", "instagram_login", "tiktok_login", "youtube_login"))
 async def cmd_video_login(message: types.Message):
     platform = message.text.split()[0].split("@")[0][1:].removesuffix("_login")
     await start_video_login(message, platform)
@@ -3267,9 +3272,23 @@ async def handle_partial_selection(message: types.Message):
         PENDING_PARTIAL_REQUESTS.pop(message.from_user.id, None)
 
 
+def recover_legacy_youtube_downloads():
+    """Recover empty gallery failures only when their original chat is known."""
+    for entry in db.load_history():
+        if (entry.get("media_kind") == "video" or entry.get("status") not in ("interrupted", "failed")
+                or entry.get("image_count") or video_platform(entry["url"]) != "youtube"):
+            continue
+        chat_id = entry.get("owner_chat_id") or entry.get("auto_resume_chat_id") or ""
+        if not chat_id.lstrip("-").isdigit() or int(chat_id) == 0:
+            continue
+        folder = VIDEO_DOWNLOAD_DIR / "youtube" / chat_id / f"retry_{entry['_id']}"
+        db.promote_empty_video_download(entry["_id"], chat_id, str(folder))
+
+
 async def main():
     db.init_db()
     db.recover_video_downloads()
+    recover_legacy_youtube_downloads()
     get_download_queue()
     asyncio.create_task(auto_resume_worker())
     logging.info("🚀 Бот запущено...")

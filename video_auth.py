@@ -6,12 +6,13 @@ import tempfile
 import time
 from pathlib import Path
 
-PLATFORMS = {"facebook": "Facebook", "instagram": "Instagram", "tiktok": "TikTok"}
+PLATFORMS = {"facebook": "Facebook", "instagram": "Instagram", "tiktok": "TikTok", "youtube": "YouTube"}
 COOKIE_LIMIT = 256 * 1024
 LOGIN_COOKIES = {
     "facebook": ({"c_user", "xs"},),
     "instagram": ({"sessionid"},),
     "tiktok": ({"sessionid"}, {"sessionid_ss"}, {"sid_tt"}),
+    "youtube": ({"SAPISID"}, {"__Secure-3PAPISID"}),
 }
 
 

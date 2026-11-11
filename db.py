@@ -496,6 +496,21 @@ def mark_download_interrupted(download_id: Optional[int]):
         )
 
 
+def promote_empty_video_download(download_id: int, chat_id: str, download_dir: str):
+    """Preserve the original owner and ID when a newly supported video was misrouted."""
+    with get_db() as conn:
+        conn.execute(
+            """UPDATE downloads SET media_kind='video', owner_chat_id=?, download_dir=?,
+                      resume_url=url, status='interrupted', auto_resume_at='', auto_resume_chat_id='',
+                      gallery_name='YouTube — відео', retry_count=0
+               WHERE id=? AND media_kind='gallery' AND status IN ('interrupted', 'failed')
+                 AND image_count=0 AND (owner_chat_id=? OR (owner_chat_id='' AND auto_resume_chat_id=?))
+                 AND NOT EXISTS (SELECT 1 FROM zip_parts WHERE download_id=downloads.id)
+                 AND NOT EXISTS (SELECT 1 FROM image_messages WHERE download_id=downloads.id)""",
+            (chat_id, download_dir, download_id, chat_id, chat_id),
+        )
+
+
 def recover_video_downloads():
     """A restarted process has no workers for the old in-progress video jobs."""
     with get_db() as conn:
