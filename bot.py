@@ -440,6 +440,7 @@ def build_video_history_keyboard(index: int, entry: dict) -> InlineKeyboardMarku
         platform = video_platform(entry.get("url", ""))
         if platform and int(entry.get("owner_chat_id") or 0) > 0:
             buttons.append([video_login_button(int(entry["owner_chat_id"]), platform)])
+            buttons.append([video_retry_button(platform)])
     buttons.extend([
         [InlineKeyboardButton(text="🔗 Отримати посилання", callback_data=f"get_url:{index}")],
         [InlineKeyboardButton(text="🗑 Видалити з історії", callback_data=f"delete_history_item:{index}")],
@@ -453,6 +454,51 @@ def video_login_button(chat_id: int, platform: str) -> InlineKeyboardButton:
     return InlineKeyboardButton(text=f"🔐 {action} {PLATFORMS[platform]}", callback_data=f"video_login:{platform}")
 
 
+def video_retry_button(platform: str) -> InlineKeyboardButton:
+    return InlineKeyboardButton(text=f"⏩ Докачати невдалі {PLATFORMS[platform]}",
+                                callback_data=f"video_retry:{platform}")
+
+
+def enqueue_video_retry(chat_id: int, entry: dict) -> bool:
+    """Share the atomic claim across batch, individual and background retries."""
+    global queue_worker_started
+    platform = video_platform(entry["url"])
+    if chat_id <= 0 or not platform:
+        return False
+    download_id = entry.get("id") or entry["_id"]
+    folder = (Path(entry["download_dir"]) if entry["download_dir"] else
+              VIDEO_DOWNLOAD_DIR / platform / str(chat_id) / f"retry_{download_id}")
+    if not db.claim_video_retry(download_id, chat_id, str(folder)):
+        return False
+    get_download_queue().put_nowait((ChatMessageProxy(chat_id), entry["url"], download_id, folder))
+    if not queue_worker_started:
+        queue_worker_started = True
+        asyncio.create_task(queue_worker())
+    return True
+
+
+def enqueue_failed_videos(chat_id: int, platform: str) -> int:
+    """No awaits between claiming persistent jobs and adding them to the queue."""
+    if chat_id <= 0 or platform not in PLATFORMS:
+        raise VideoAuthError("Повторне завантаження з акаунтом доступне лише в особистому чаті.")
+    if not video_auth.read(chat_id, platform):
+        raise VideoAuthError(f"Спочатку підключи {PLATFORMS[platform]}.")
+    entries = db.list_chat_video_downloads(chat_id)
+    handled = {normalize_gallery_url(entry["url"]) for entry in entries
+               if entry["status"] in ("done", "in_progress")}
+    # For duplicate failures, prefer the job with more completed files, then the newest.
+    candidates = []
+    for entry in sorted(entries, key=lambda e: (e["image_count"], e["id"]), reverse=True):
+        url = normalize_gallery_url(entry["url"])
+        if (entry["status"] not in ("interrupted", "failed") or url in handled
+                or video_platform(entry["url"]) != platform):
+            continue
+        handled.add(url)
+        candidates.append(entry)
+    return sum(enqueue_video_retry(chat_id, entry)
+               for entry in sorted(candidates, key=lambda e: e["id"]))
+
+
 async def suggest_video_login(message, platform: str, *, required: bool):
     if message.chat.id <= 0:
         await message.answer(
@@ -464,7 +510,7 @@ async def suggest_video_login(message, platform: str, *, required: bool):
                    "Це може допомогти, якщо сайт вимагає вхід; точну причину відмови визначити не вдалося. ")
     await message.answer(
         f"🔐 {explanation}\nНатисни кнопку нижче або надішли /{platform}_login.\n"
-        "Після імпорту cookies натисни «Докачати» в історії.",
+        "Після імпорту cookies автоматично повторю невдалі завантаження цього сервісу в цьому чаті.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[video_login_button(message.chat.id, platform)]]))
 
 
@@ -2004,6 +2050,10 @@ async def auto_resume_worker():
             message = ChatMessageProxy(int(chat_id))
             await message.answer("⏩ Починаю автоматичну докачку...")
 
+            if entry.get("media_kind") == "video" and int(chat_id) > 0:
+                if enqueue_video_retry(int(chat_id), entry):
+                    break
+                continue
             db.update_history_entry(index, status="in_progress", auto_resume_at="", download_dir=download_dir_value)
             await get_download_queue().put((message, entry["resume_url"], entry["_id"], Path(download_dir_value)))
 
@@ -2825,6 +2875,13 @@ async def resume_download(callback: types.CallbackQuery):
         return
 
     entry = history[index]
+    if entry.get("media_kind") == "video" and callback.message.chat.id > 0:
+        if not enqueue_video_retry(callback.message.chat.id, entry):
+            await callback.answer("Відео вже завантажене або додане в чергу.", show_alert=True)
+            return
+        await callback.answer()
+        await callback.message.answer("⏩ Докачку відео додано в чергу.")
+        return
     resume_url = entry.get("resume_url")
     download_dir_value = entry.get("download_dir")
 
@@ -2916,6 +2973,7 @@ async def start_video_login(message, platform: str):
         "Cookies дають доступ до твого акаунта — це приватний файл. "
         "Бот збереже лише cookies обраного сайту для цього особистого чату "
         "і спробує видалити повідомлення з файлом. Пароль не потрібен.\n"
+        "Після збереження cookies невдалі відео цього сервісу з історії автоматично повернуться в чергу.\n"
         "Скасувати: /cancel.")
 
 
@@ -2939,7 +2997,28 @@ async def video_accounts_callback(callback: types.CallbackQuery):
             InlineKeyboardButton(text=f"🔐 {label}", callback_data=f"video_login:{platform}"),
             InlineKeyboardButton(text="Відключити", callback_data=f"video_logout:{platform}"),
         ])
+        buttons.append([video_retry_button(platform)])
     await callback.message.answer("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+
+
+@dp.callback_query(F.data.startswith("video_retry:"))
+async def video_retry_callback(callback: types.CallbackQuery):
+    platform = callback.data.split(":", 1)[1]
+    if platform not in PLATFORMS:
+        await callback.answer("Невідомий сервіс.", show_alert=True)
+        return
+    # Queue first so a failed Telegram acknowledgement cannot lose the retry request.
+    try:
+        queued = enqueue_failed_videos(callback.message.chat.id, platform)
+    except VideoAuthError as exc:
+        await callback.answer()
+        await callback.message.answer(f"🔐 {html.escape(str(exc))}")
+        await suggest_video_login(callback.message, platform, required=True)
+        return
+    await callback.answer()
+    text = (f"⏩ Додано в чергу невдалих відео {PLATFORMS[platform]}: <b>{queued}</b>."
+            if queued else f"Немає невдалих відео {PLATFORMS[platform]} для повторної спроби.")
+    await callback.message.answer(text, reply_markup=build_main_menu())
 
 
 @dp.callback_query(F.data.startswith("video_login:"))
@@ -2982,8 +3061,12 @@ async def receive_video_cookies(message: types.Message):
         await message.answer("Не вдалося отримати файл. Надішли його ще раз.")
     else:
         video_auth.pending.pop(message.chat.id, None)
-        await message.answer(f"✅ Сесію {PLATFORMS[platform]} збережено. Надішли посилання, "
-                             "запусти /grab_pending або докачай відео з історії.")
+        queued = enqueue_failed_videos(message.chat.id, platform)
+        note = (f"⏩ Автоматично додано в чергу невдалих відео: <b>{queued}</b>."
+                if queued else "Невдалих відео для повторної спроби зараз немає.")
+        await message.answer(f"✅ Сесію {PLATFORMS[platform]} збережено.\n{note}\n"
+                             "Для ще не запущених посилань: /grab_pending.",
+                             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[video_retry_button(platform)]]))
     finally:
         try:
             await message.delete()

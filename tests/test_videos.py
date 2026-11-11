@@ -339,6 +339,14 @@ class VideoBotTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status, "queued")
         return self.module.get_download_queue().get_nowait()
 
+    def video_entry(self, url=URLS[0], chat_id=123, status="interrupted", image_count=0):
+        index = db.add_history_entry(url, "")
+        folder = self.root / "images" / "videos" / f"existing-{index}"
+        db.update_history_entry(index, media_kind="video", owner_chat_id=str(chat_id),
+                                status=status, image_count=image_count, resume_url=url,
+                                download_dir=str(folder))
+        return index, folder
+
     async def completed_download(self, url, folder, cookie_data, **kwargs):
         folder.mkdir(parents=True, exist_ok=True)
         (folder / "clip.mp4").write_bytes(b"synthetic-video-with-audio")
@@ -515,6 +523,8 @@ class VideoBotTests(unittest.IsolatedAsyncioTestCase):
                               from_user=user, text=text, document=document)
             await self.module.dp.feed_update(self.module.bot, Update(update_id=1, message=message))
 
+        facebook_index, folder = self.video_entry()
+        instagram_index, _ = self.video_entry(URLS[1])
         await feed("/facebook_login")
         self.assertEqual(self.module.video_auth.pending[123], "facebook")
 
@@ -526,9 +536,140 @@ class VideoBotTests(unittest.IsolatedAsyncioTestCase):
                                          file_size=len(cookies())))
         self.assertEqual(self.module.video_auth.read(123, "facebook"), cookies())
         self.assertNotIn(123, self.module.video_auth.pending)
+        queue = self.module.get_download_queue()
+        self.assertEqual(queue.qsize(), 1)
+        message, url, download_id, queued_folder = queue.get_nowait()
+        self.assertEqual((message.chat.id, url, download_id, queued_folder),
+                         (123, URLS[0], db.find_download_id_by_index(facebook_index), folder))
+        self.assertEqual(db.load_history()[instagram_index]["status"], "interrupted")
         await feed("/tiktok_login")
         await feed("/cancel")
         self.assertNotIn(123, self.module.video_auth.pending)
+
+    async def test_batch_retry_is_scoped_to_chat_and_site_and_preserves_history(self):
+        first, first_folder = self.video_entry()
+        second, second_folder = self.video_entry(URLS[0] + "?v=2", status="failed")
+        other_site, _ = self.video_entry(URLS[1])
+        other_chat, _ = self.video_entry(chat_id=456)
+        done, _ = self.video_entry(URLS[0] + "?v=3", status="done")
+        active, _ = self.video_entry(URLS[0] + "?v=4", status="in_progress")
+        gallery = db.add_history_entry(URLS[0] + "?v=5", "images/gallery")
+        db.update_history_entry(gallery, status="interrupted")
+        self.module.video_auth.save(123, "facebook", cookies())
+        self.assertEqual(self.module.enqueue_failed_videos(123, "facebook"), 2)
+        self.assertEqual(self.module.enqueue_failed_videos(123, "facebook"), 0)
+        queue = self.module.get_download_queue()
+        self.assertEqual([queue.get_nowait()[2:] for _ in range(queue.qsize())], [
+            (db.find_download_id_by_index(first), first_folder),
+            (db.find_download_id_by_index(second), second_folder)])
+        history = db.load_history()
+        self.assertEqual(len(history), 7)
+        for index in (other_site, other_chat, gallery):
+            self.assertEqual(history[index]["status"], "interrupted")
+        self.assertEqual(history[done]["status"], "done")
+        self.assertEqual(history[active]["status"], "in_progress")
+
+    async def test_batch_retry_deduplicates_urls_and_prefers_existing_progress(self):
+        best, folder = self.video_entry(image_count=1)
+        folder.mkdir(parents=True)
+        partial = folder / "clip.mp4.part"
+        partial.write_bytes(b"existing-fragments")
+        duplicate, _ = self.video_entry(URLS[0] + "#same")
+        completed_url = URLS[0] + "?v=completed"
+        self.video_entry(completed_url)
+        self.video_entry(completed_url, status="done")
+        active_url = URLS[0] + "?v=active"
+        self.video_entry(active_url)
+        self.video_entry(active_url, status="in_progress")
+        db.update_history_entry(best, auto_resume_at="2099-01-01 00:00:00", auto_resume_chat_id="123")
+        self.module.video_auth.save(123, "facebook", cookies())
+        self.assertEqual(self.module.enqueue_failed_videos(123, "facebook"), 1)
+        self.assertEqual(self.module.get_download_queue().get_nowait()[2], db.find_download_id_by_index(best))
+        self.assertEqual(partial.read_bytes(), b"existing-fragments")
+        history = db.load_history()
+        self.assertEqual(history[best]["image_count"], 1)
+        self.assertEqual(history[best]["auto_resume_at"], "")
+        self.assertEqual(history[duplicate]["status"], "interrupted")
+
+    async def test_batch_retry_requires_valid_cookies_and_private_chat(self):
+        index, _ = self.video_entry()
+        for chat_id, platform in ((123, "facebook"), (-100, "facebook"), (123, "unknown")):
+            with self.assertRaises(auth.VideoAuthError):
+                self.module.enqueue_failed_videos(chat_id, platform)
+        self.module.video_auth.save(123, "facebook", cookies())
+        self.module.video_auth.path(123, "facebook").write_bytes(cookies(expiry="1"))
+        with self.assertRaises(auth.VideoAuthError):
+            self.module.enqueue_failed_videos(123, "facebook")
+        self.assertEqual(self.module.get_download_queue().qsize(), 0)
+        self.assertEqual(db.load_history()[index]["status"], "interrupted")
+
+    async def test_video_retry_claim_checks_owner_state_and_media_type(self):
+        index, folder = self.video_entry()
+        download_id = db.find_download_id_by_index(index)
+        self.assertFalse(db.claim_video_retry(download_id, 456, str(folder)))
+        self.assertTrue(db.claim_video_retry(download_id, 123, str(folder)))
+        self.assertFalse(db.claim_video_retry(download_id, 123, str(folder)))
+        gallery = db.add_history_entry(URLS[0], "images/gallery")
+        db.update_history_entry(gallery, status="interrupted", owner_chat_id="123")
+        self.assertFalse(db.claim_video_retry(db.find_download_id_by_index(gallery), 123, "images/gallery"))
+
+    async def test_individual_and_batch_retries_do_not_duplicate_a_queued_job(self):
+        index, _ = self.video_entry()
+        self.module.video_auth.save(123, "facebook", cookies())
+        callback = SimpleNamespace(data=f"resume:{index}", message=self.message, answer=AsyncMock())
+        await self.module.resume_download(callback)
+        self.assertEqual(self.module.enqueue_failed_videos(123, "facebook"), 0)
+        await self.module.resume_download(callback)
+        self.assertEqual(self.module.get_download_queue().qsize(), 1)
+
+    async def test_retry_callback_queues_before_failed_telegram_reply(self):
+        index, _ = self.video_entry()
+        self.module.video_auth.save(123, "facebook", cookies())
+        callback = SimpleNamespace(data="video_retry:facebook", message=self.message,
+                                   answer=AsyncMock(side_effect=RuntimeError("Telegram unavailable")))
+        with self.assertRaisesRegex(RuntimeError, "Telegram unavailable"):
+            await self.module.video_retry_callback(callback)
+        self.assertEqual(self.module.get_download_queue().qsize(), 1)
+        self.assertEqual(db.load_history()[index]["status"], "in_progress")
+
+    async def test_cookie_import_queues_retries_even_when_confirmation_cannot_be_sent(self):
+        index, _ = self.video_entry()
+        self.module.video_auth.pending[123] = "facebook"
+        self.message.document = SimpleNamespace(file_size=len(cookies()))
+        self.message.answer.side_effect = RuntimeError("Telegram unavailable")
+
+        async def download_file(document, destination):
+            destination.write(cookies())
+
+        with patch.object(self.module.bot, "download", AsyncMock(side_effect=download_file)):
+            with self.assertRaisesRegex(RuntimeError, "Telegram unavailable"):
+                await self.module.receive_video_cookies(self.message)
+        self.assertEqual(self.module.get_download_queue().qsize(), 1)
+        self.assertEqual(db.load_history()[index]["status"], "in_progress")
+        self.assertEqual(self.module.video_auth.read(123, "facebook"), cookies())
+        self.message.delete.assert_awaited_once()
+
+    async def test_retry_button_dispatch_uses_only_the_current_chat(self):
+        index, _ = self.video_entry()
+        self.module.video_auth.save(456, "facebook", cookies())
+        self.module.bot.session = RecordingSession()
+        user = User(id=456, is_bot=False, first_name="Other")
+        message = Message(message_id=1, date=datetime.now(timezone.utc),
+                          chat=Chat(id=456, type="private"), from_user=user)
+        update = Update(update_id=1, callback_query=CallbackQuery(
+            id="test", from_user=user, chat_instance="test", message=message, data="video_retry:facebook"))
+        await self.module.dp.feed_update(self.module.bot, update)
+        self.assertEqual(self.module.get_download_queue().qsize(), 0)
+        self.assertEqual(db.load_history()[index]["status"], "interrupted")
+
+    async def test_retry_without_old_directory_gets_a_stable_ssd_path(self):
+        index, _ = self.video_entry()
+        db.update_history_entry(index, download_dir="")
+        self.module.video_auth.save(123, "facebook", cookies())
+        self.assertEqual(self.module.enqueue_failed_videos(123, "facebook"), 1)
+        _, _, download_id, folder = self.module.get_download_queue().get_nowait()
+        self.assertEqual(folder, self.module.VIDEO_DOWNLOAD_DIR / "facebook" / "123" / f"retry_{download_id}")
+        self.assertEqual(db.load_history()[index]["download_dir"], str(folder))
 
     async def test_schema_v5_upgrade_preserves_history(self):
         # Simulate the production schema before the new columns existed.

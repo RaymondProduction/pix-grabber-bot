@@ -459,6 +459,30 @@ def claim_download_request(token: str, chat_id: int, download_dir: str, *, media
         return cursor.lastrowid
 
 
+def list_chat_video_downloads(chat_id: int) -> list[dict]:
+    """Read retry candidates without loading every file/message in global history."""
+    with get_db() as conn:
+        return [dict(row) for row in conn.execute(
+            """SELECT id, url, status, download_dir, image_count FROM downloads
+               WHERE media_kind='video' AND owner_chat_id=? ORDER BY id""", (str(chat_id),)
+        )]
+
+
+def claim_video_retry(download_id: int, chat_id: int, download_dir: str) -> bool:
+    """Claim an existing failed job once, retaining its history and downloaded files."""
+    if chat_id <= 0:
+        return False
+    with get_db() as conn:
+        result = conn.execute(
+            """UPDATE downloads SET status='in_progress', resume_url=url, download_dir=?,
+                      auto_resume_at='', auto_resume_chat_id=''
+               WHERE id=? AND owner_chat_id=? AND media_kind='video'
+                 AND status IN ('interrupted', 'failed')""",
+            (download_dir, download_id, str(chat_id)),
+        )
+        return result.rowcount == 1
+
+
 def mark_download_interrupted(download_id: Optional[int]):
     """Не залишаємо аварійно завершену задачу активною; ID не зсувається при видаленні."""
     with get_db() as conn:
