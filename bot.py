@@ -32,7 +32,7 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 import db
 from pixiv_auth import PixivAuth, PixivAuthError, is_oauth_response, is_pixiv_url
 from media_support import ANIMATION_EXTENSIONS, PIXIV_POSTPROCESSORS, DownloadActivity, probe_animation
-from author_metadata import GALLERY_AUTHOR_POSTPROCESSOR, parse_gallery_authors, source_platform, write_author_sidecar
+from author_metadata import GALLERY_AUTHOR_POSTPROCESSOR, clean, parse_gallery_authors, source_platform, write_author_sidecar
 from video_auth import VideoAuth, VideoAuthError, PLATFORMS, COOKIE_LIMIT
 from video_delivery import VideoDeliveryError, prepare_video_parts, create_video_preview
 from video_support import (
@@ -414,6 +414,30 @@ def build_history_actions_keyboard(index: int, url: str) -> InlineKeyboardMarkup
     ])
 
 
+def format_author_lines(entry: dict) -> str:
+    """Use explicit roles: the legacy 'author' label can contain only an uploader."""
+    def names(roles):
+        labels = []
+        for author in entry.get("authors") or []:
+            if author.get("role") not in roles:
+                continue
+            name = clean(author.get("name") or author.get("username") or author.get("external_id"))
+            username = clean(author.get("username")).lstrip("@")
+            if username and name.lstrip("@").casefold() != username.casefold():
+                name += f" (@{username})"
+            if name and name not in labels:
+                labels.append(name)
+        text = ", ".join(labels) or "не вказано"
+        # Keep both lines short enough for Telegram media captions as well.
+        encoded = text.encode("utf-16-le", errors="replace")
+        if len(encoded) > 320:
+            text = encoded[:318].decode("utf-16-le", errors="ignore") + "…"
+        return html.escape(text)
+
+    return (f"✍️ Автор: {names({'artist', 'creator'})}\n"
+            f"👤 Завантажив на сайт: {names({'uploader'})}\n")
+
+
 def can_access_entry(entry: dict, chat_id: int) -> bool:
     return entry.get("media_kind") != "video" or entry.get("owner_chat_id") == str(chat_id)
 
@@ -632,7 +656,7 @@ async def deliver_saved_videos(message, entry: dict, *, as_document: bool):
             continue
         title = str(item.get("title") or path.stem)
         size = path.stat().st_size
-        caption = html.escape(str(item.get("title") or path.stem)[:300])
+        caption = html.escape(str(item.get("title") or path.stem)[:300]) + "\n" + format_author_lines(entry)
         try:
             if size > MAX_DOCUMENT_UPLOAD_SIZE:
                 sent_count += await send_video_parts(message, entry, path, title)
@@ -733,6 +757,7 @@ async def run_video_download(message, url: str, history_index: int, download_dir
         await send_saved_videos(message, history_index, entry)
     await message.answer(
         f"{'⏸' if error else '✅'} Відео збережено: {len(items)}.\n"
+        f"{format_author_lines(entry)}"
         f"📁 <code>{html.escape(str(download_dir))}</code>",
         reply_markup=build_video_history_keyboard(history_index, entry))
 
@@ -1012,6 +1037,7 @@ async def send_archive_preview(
 ):
     # Якщо превʼю вже збережено в БД — не відправляємо повторно
     history = db.load_history()
+    entry = history[history_index] if 0 <= history_index < len(history) else {}
     if 0 <= history_index < len(history):
         existing_preview = history[history_index].get("preview_message") or {}
         if existing_preview.get("message_id"):
@@ -1032,7 +1058,8 @@ async def send_archive_preview(
                         message, data, Path(refs[0]["image_name"]).name,
                         caption=(
                             f"🖼 Превʼю архіву\n"
-                            f"Назва: {gallery_name}\n"
+                            f"Назва: {html.escape(gallery_name[:300])}\n"
+                            f"{format_author_lines(entry)}"
                             f"Файлів: {image_count if image_count else 'рахується...'}"
                         )
                     )
@@ -1058,7 +1085,8 @@ async def send_archive_preview(
             message, data, preview_image.name,
             caption=(
                 f"🖼 Превʼю архіву\n"
-                f"Назва: {gallery_name}\n"
+                f"Назва: {html.escape(gallery_name[:300])}\n"
+                f"{format_author_lines(entry)}"
                 f"Файлів: {image_count if image_count else 'рахується...'}"
             )
         )
@@ -1111,7 +1139,8 @@ async def send_history_item_preview(message: types.Message, index: int, entry: d
             message, preview_data, Path(first_ref["image_name"]).name,
             caption=(
                 f"🖼 Превʼю архіву\n"
-                f"Назва: {entry['gallery_name']}\n"
+                f"Назва: {html.escape(entry['gallery_name'][:300])}\n"
+                f"{format_author_lines(entry)}"
                 f"Файлів: {entry['image_count']}"
             )
         )
@@ -1398,6 +1427,7 @@ async def finalize_streaming_archives(
         delivery_note = "\n⚠️ Частину архівів не надіслано. Вони збережені — відкрий запис в історії та надішли архів повторно."
     await message.answer(
         f"✅ Скачування завершено.\n"
+        f"{format_author_lines(entry)}"
         f"📦 Архівних частин (цей сеанс): {len(state['zip_paths'])}\n"
         f"🖼 Файлів загалом: {total_image_count}{delivery_note}",
         reply_markup=build_main_menu()
@@ -1595,7 +1625,7 @@ async def send_history_preview_images(message: types.Message, page_items: list[t
                         preview_data, preview_name = ensure_telegram_photo_compatible(preview_data, preview_name)
                     media.append(media_type(
                         media=types.BufferedInputFile(preview_data, filename=preview_name),
-                        caption=f"{real_index + 1}. {entry['gallery_name'][:80]}"
+                        caption=f"{real_index + 1}. {html.escape(entry['gallery_name'][:80])}\n{format_author_lines(entry)}"
                     ))
                     preview_added = True
             except Exception as e:
@@ -2259,6 +2289,7 @@ async def handle_url(message: types.Message, url: str):
             await message.answer(
                 f"⏸ Це посилання вже є в історії — скачування було перерване.\n\n"
                 f"📁 <b>{entry['gallery_name']}</b>\n"
+                f"{format_author_lines(entry)}"
                 f"🖼 Збережено: {entry['image_count']} файлів\n"
                 f"📅 {entry['date']}\n\n"
                 f"Докачати з того самого місця?",
@@ -2273,6 +2304,7 @@ async def handle_url(message: types.Message, url: str):
             await message.answer(
                 f"🟡 Це посилання вже завантажується.\n\n"
                 f"📁 <b>{entry['gallery_name']}</b>\n"
+                f"{format_author_lines(entry)}"
                 f"📅 {entry['date']}",
                 reply_markup=build_main_menu()
             )
@@ -2284,11 +2316,13 @@ async def handle_url(message: types.Message, url: str):
         history = db.load_history()
         entry = history[existing_index]
         if entry.get("media_kind") == "video":
+            await message.answer(f"🎬 <b>{html.escape(entry['gallery_name'])}</b>\n{format_author_lines(entry)}")
             await send_saved_videos(message, existing_index, entry)
             return
         await message.answer(
             f"♻️ Це посилання вже є в історії і архів уже скачано.\n\n"
             f"📁 <b>{entry['gallery_name']}</b>\n"
+            f"{format_author_lines(entry)}"
             f"🖼 Файлів: {entry['image_count']}\n"
             f"📅 {entry['date']}\n\n"
             f"Відправляю готовий архів з історії."
@@ -2728,6 +2762,7 @@ async def history_item_callback(callback: types.CallbackQuery):
                         "in_progress": "завантажується", "failed": "помилка"}.get(entry["status"], entry["status"])
         await callback.message.answer(
             f"🎬 <b>{html.escape(entry['gallery_name'])}</b>\n"
+            f"{format_author_lines(entry)}"
             f"Відео: {entry['image_count']} • {status_label}\n"
             f"📁 <code>{html.escape(entry['download_dir'])}</code>\n"
             f"🔗 {html.escape(entry['url'])}",
@@ -2750,6 +2785,7 @@ async def history_item_callback(callback: types.CallbackQuery):
             )
         await callback.message.answer(
             f"⏸ <b>{entry['gallery_name']}</b>\n"
+            f"{format_author_lines(entry)}"
             f"🖼 Збережено: {entry['image_count']} файлів\n"
             f"📅 {entry['date']}\n"
             f"🔗 {entry['url']}"
@@ -2770,6 +2806,7 @@ async def history_item_callback(callback: types.CallbackQuery):
             )
         await callback.message.answer(
             f"🟡 <b>{entry['gallery_name']}</b>\n"
+            f"{format_author_lines(entry)}"
             f"🖼 Завантажено: {entry['image_count']} файлів\n"
             f"📅 {entry['date']}\n"
             f"🔗 {entry['url']}"
@@ -2790,6 +2827,7 @@ async def history_item_callback(callback: types.CallbackQuery):
        and not partial_request:
         await callback.message.answer(
             f"⚠️ Архів для <b>{entry['gallery_name']}</b> недоступний або видалений.\n\n"
+            f"{format_author_lines(entry)}\n"
             f"Можна спробувати скачати наново:\n{entry['url']}",
             reply_markup=build_redownload_keyboard(entry["url"], callback.message.chat.id)
         )
@@ -2807,6 +2845,7 @@ async def history_item_callback(callback: types.CallbackQuery):
 
     await callback.message.answer(
         f"📁 <b>{entry['gallery_name']}</b>\n"
+        f"{format_author_lines(entry)}"
         f"🖼 Файлів: {entry['image_count']}\n"
         f"📅 {entry['date']}\n"
         f"🔗 {entry['url']}"

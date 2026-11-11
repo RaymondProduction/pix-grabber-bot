@@ -1,5 +1,6 @@
 import asyncio
 import importlib.util
+import html
 import json
 import os
 import tempfile
@@ -53,6 +54,39 @@ class ArchiveTests(unittest.IsolatedAsyncioTestCase):
             path.write_bytes(os.urandom(size))
             files.append(path)
         return files
+
+    async def test_gallery_and_video_cards_show_distinct_author_roles_from_database(self):
+        from author_metadata import extract_authors
+        did = db.find_download_id_by_index(self.index)
+        authors = extract_authors({"tags": ["artist:Alice & Bob"], "uploader": "Publisher <One>"},
+                                  "https://e-hentai.org/g/42/abc/")
+        db.set_download_authors(did, authors, "test")
+        db.update_history_entry(self.index, status="done", image_count=1)
+        db.append_archive_message(did, "123", 10)
+        callback = SimpleNamespace(data=f"history_item:{self.index}", message=self.message,
+                                   from_user=SimpleNamespace(id=123), answer=AsyncMock())
+        for media_kind in ("gallery", "video"):
+            db.update_history_entry(self.index, media_kind=media_kind, owner_chat_id="123")
+            self.message.answer.reset_mock()
+            with patch.object(self.module, "send_history_item_preview", AsyncMock()):
+                await self.module.history_item_callback(callback)
+            text = self.message.answer.await_args.args[0]
+            self.assertIn("✍️ Автор: Alice &amp; Bob\n", text)
+            self.assertIn("👤 Завантажив на сайт: Publisher &lt;One&gt;\n", text)
+
+    async def test_author_labels_do_not_invent_roles_and_fit_media_captions(self):
+        text = self.module.format_author_lines({"author": "Posting account", "authors": [
+            {"role": "uploader", "name": "Posting account"}]})
+        self.assertIn("✍️ Автор: не вказано\n", text)
+        self.assertIn("👤 Завантажив на сайт: Posting account\n", text)
+        text = self.module.format_author_lines({"authors": [
+            {"role": "creator", "name": "Artist", "username": "handle"}]})
+        self.assertIn("✍️ Автор: Artist (@handle)\n", text)
+        self.assertIn("👤 Завантажив на сайт: не вказано\n", text)
+        text = self.module.format_author_lines({"authors": [
+            {"role": role, "name": "😀" * 300} for role in ("artist", "uploader")]})
+        caption = "🖼 Превʼю архіву\nНазва: " + "😀" * 300 + "\n" + text + "Файлів: 9999999"
+        self.assertLessEqual(len(html.unescape(caption).encode("utf-16-le")) // 2, 1024)
 
     def state(self, files):
         return {
