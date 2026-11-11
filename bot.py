@@ -32,6 +32,7 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 import db
 from pixiv_auth import PixivAuth, PixivAuthError, is_oauth_response, is_pixiv_url
 from media_support import ANIMATION_EXTENSIONS, PIXIV_POSTPROCESSORS, DownloadActivity, probe_animation
+from author_metadata import GALLERY_AUTHOR_POSTPROCESSOR, parse_gallery_authors, source_platform, write_author_sidecar
 from video_auth import VideoAuth, VideoAuthError, PLATFORMS, COOKIE_LIMIT
 from video_delivery import VideoDeliveryError, prepare_video_parts, create_video_preview
 from video_support import (
@@ -669,6 +670,16 @@ async def deliver_saved_videos(message, entry: dict, *, as_document: bool):
     return sent_count
 
 
+def persist_authors(download_id: int, url: str, authors: list[dict], source: str):
+    if not authors or not db.set_download_authors(download_id, authors, source):
+        return
+    try:
+        write_author_sidecar(ARCHIVE_DIR / "metadata" / f"download-{download_id}.authors.json",
+                             url, db.get_download_authors(download_id))
+    except OSError:
+        logging.warning("Could not write author sidecar for download %s; identities are saved in the database", download_id)
+
+
 async def run_video_download(message, url: str, history_index: int, download_dir: Path):
     platform = video_platform(url)
     download_id = db.find_download_id_by_index(history_index)
@@ -686,6 +697,7 @@ async def run_video_download(message, url: str, history_index: int, download_dir
             timeout=int(CONFIG.get("video_timeout_sec", 1800)),
             stall_timeout=int(CONFIG.get("video_stall_timeout_sec", 300)),
             max_bytes=int(CONFIG.get("max_video_download_size_mb", 2048)) * 1024 ** 2,
+            on_authors=lambda authors: persist_authors(download_id, url, authors, "yt-dlp"),
         )
         if video_auth.read(message.chat.id, platform) != cookies:
             raise VideoAuthError("Сесію змінено під час завантаження. Повтори дію з історії.")
@@ -705,6 +717,8 @@ async def run_video_download(message, url: str, history_index: int, download_dir
         await message.answer("У цьому дописі немає відео. Завантажую його як галерею зображень.")
         return await run_gallery_download(message, url, history_index, photo_dir)
     items = saved_videos(download_dir)
+    if not error:
+        db.mark_author_check(download_id)
     title = items[0]["title"] if items else f"{PLATFORMS[platform]} — відео"
     db.update_history_entry(history_index, status="interrupted" if error else "done",
                             gallery_name=title, image_count=len(items),
@@ -1815,6 +1829,7 @@ async def run_download(message: types.Message, url: str, history_index: int, dow
 
 
 async def run_gallery_download(message: types.Message, url: str, history_index: int, download_dir: Path):
+    download_id = db.find_download_id_by_index(history_index)
     cfg = get_site_config(url)
     username = cfg.get("username")
     password = cfg.get("password")
@@ -1837,7 +1852,7 @@ async def run_gallery_download(message: types.Message, url: str, history_index: 
     ]
     if pixiv_download:
         cmd.extend(["--config", str(pixiv_auth.token_path(message.chat.id).resolve())])
-        cmd.extend(["-o", "extractor.pixiv.ugoira=true", "-o", "postprocessors=" + json.dumps(PIXIV_POSTPROCESSORS)])
+        cmd.extend(["-o", "extractor.pixiv.ugoira=true"])
     elif username and password:
         cmd.extend(["--username", username, "--password", password])
     cookies_browser = CONFIG.get("gallery_dl_cookies_browser", "")
@@ -1847,13 +1862,17 @@ async def run_gallery_download(message: types.Message, url: str, history_index: 
         cookies_path = Path("cookies.txt")
         if cookies_path.exists():
             cmd.extend(["--cookies", str(cookies_path.resolve())])
-    cmd.append(url)
+    postprocessors = (list(PIXIV_POSTPROCESSORS) if pixiv_download else []) + [GALLERY_AUTHOR_POSTPROCESSOR]
+    if source_platform(url) == "rule34":
+        cmd.extend(["-o", "extractor.rule34.tags=true"])
+    cmd.extend(["-o", "postprocessors=" + json.dumps(postprocessors), url])
 
     process = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         start_new_session=(os.name == "posix"),
+        env={**os.environ, "PYTHONUNBUFFERED": "1"}, limit=256 * 1024,
     )
 
     loop = asyncio.get_running_loop()
@@ -1883,6 +1902,7 @@ async def run_gallery_download(message: types.Message, url: str, history_index: 
     output_lines: list[str] = []
     sent_error_lines: set[str] = set()
     stall_triggered = False
+    seen_authors = set()
 
     def _is_gallery_error_line(line: str) -> bool:
         ll = line.lower()
@@ -1912,6 +1932,14 @@ async def run_gallery_download(message: types.Message, url: str, history_index: 
                 break
             decoded = line.decode("utf-8", errors="ignore").rstrip("\n")
             if not decoded:
+                continue
+            authors = parse_gallery_authors(decoded, url) if stream_name == "stdout" else None
+            if authors is not None:
+                fresh = [a for a in authors if tuple(sorted(a.items())) not in seen_authors]
+                if fresh:
+                    persist_authors(download_id, url, fresh, "gallery-dl")
+                    seen_authors.update(tuple(sorted(a.items())) for a in fresh)
+                activity.touch(loop.time())
                 continue
             tagged = f"[{stream_name}] {decoded}"
             activity.touch(loop.time())
@@ -1991,6 +2019,8 @@ async def run_gallery_download(message: types.Message, url: str, history_index: 
             stdout_task.cancel()
             stderr_task.cancel()
 
+    if process.returncode == 0:
+        db.mark_author_check(download_id)
     animation_failed = False
     for path in get_downloaded_images(download_dir):
         if path.suffix.lower() not in ANIMATION_EXTENSIONS:

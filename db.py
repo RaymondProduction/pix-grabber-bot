@@ -8,6 +8,8 @@ db.py — нормалізована SQLite-БД для PixGrabber Bot.
   image_messages   — Telegram-повідомлення з окремими фото
   preview_messages — Telegram-повідомлення з превʼю
   download_requests — збережені посилання до натискання кнопки завантаження
+  authors          — ідентичності авторів окремо для кожного сервісу
+  download_authors — автори завантаження, їхні ролі та джерело метаданих
 
 Публічний API повністю сумісний зі старим (history як list[dict]),
 тому bot.py потребує мінімальних змін.
@@ -61,11 +63,34 @@ CREATE TABLE IF NOT EXISTS downloads (
     auto_resume_chat_id TEXT NOT NULL DEFAULT '',
     retry_count   INTEGER NOT NULL DEFAULT 0,
     media_kind    TEXT NOT NULL DEFAULT 'gallery',
-    owner_chat_id TEXT NOT NULL DEFAULT ''
+    owner_chat_id TEXT NOT NULL DEFAULT '',
+    author_status TEXT NOT NULL DEFAULT 'pending',
+    author_checked_at TEXT NOT NULL DEFAULT '',
+    author_error TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_downloads_url    ON downloads(url);
 CREATE INDEX IF NOT EXISTS idx_downloads_status ON downloads(status);
+
+CREATE TABLE IF NOT EXISTS authors (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    platform TEXT NOT NULL,
+    identity_key TEXT NOT NULL,
+    external_id TEXT NOT NULL DEFAULT '',
+    username TEXT NOT NULL DEFAULT '',
+    name TEXT NOT NULL DEFAULT '',
+    profile_url TEXT NOT NULL DEFAULT '',
+    UNIQUE(platform, identity_key)
+);
+CREATE INDEX IF NOT EXISTS idx_authors_name ON authors(name COLLATE NOCASE);
+CREATE TABLE IF NOT EXISTS download_authors (
+    download_id INTEGER NOT NULL REFERENCES downloads(id) ON DELETE CASCADE,
+    author_id INTEGER NOT NULL REFERENCES authors(id),
+    role TEXT NOT NULL,
+    source TEXT NOT NULL,
+    PRIMARY KEY(download_id, author_id, role)
+);
+CREATE INDEX IF NOT EXISTS idx_download_authors_author ON download_authors(author_id, download_id);
 
 CREATE TABLE IF NOT EXISTS zip_parts (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -120,7 +145,7 @@ CREATE TABLE IF NOT EXISTS schema_version (
 );
 """
 
-CURRENT_SCHEMA_VERSION = 6
+CURRENT_SCHEMA_VERSION = 7
 
 
 def init_db():
@@ -144,6 +169,10 @@ def init_db():
 
 def _migrate(conn: sqlite3.Connection, from_version: int):
     """Запускає всі pending-міграції по порядку."""
+    if from_version < 7:
+        _ensure_downloads_column(conn, "author_status", "TEXT NOT NULL DEFAULT 'pending'")
+        _ensure_downloads_column(conn, "author_checked_at", "TEXT NOT NULL DEFAULT ''")
+        _ensure_downloads_column(conn, "author_error", "TEXT NOT NULL DEFAULT ''")
     if from_version < 6:
         _ensure_downloads_column(conn, "media_kind", "TEXT NOT NULL DEFAULT 'gallery'")
         _ensure_downloads_column(conn, "owner_chat_id", "TEXT NOT NULL DEFAULT ''")
@@ -307,11 +336,77 @@ def _insert_legacy_entry(conn: sqlite3.Connection, entry: dict):
             "INSERT INTO preview_messages(download_id, chat_id, message_id) VALUES (?,?,?)",
             (download_id, str(preview["chat_id"]), int(preview["message_id"]))
         )
+    if entry.get("authors"):
+        _merge_download_authors(conn, download_id, entry["authors"], "legacy-json")
+
+
+def _author_rows(conn, download_id):
+    return [dict(row) for row in conn.execute(
+        """SELECT a.*, da.role, da.source FROM authors a JOIN download_authors da ON da.author_id=a.id
+           WHERE da.download_id=? ORDER BY CASE da.role WHEN 'artist' THEN 0 WHEN 'creator' THEN 1 ELSE 2 END, a.name""",
+        (download_id,),
+    )]
+
+
+def get_download_authors(download_id: int) -> list[dict]:
+    with get_db() as conn:
+        return _author_rows(conn, download_id)
+
+
+def _merge_download_authors(conn, download_id, authors, source):
+    if not conn.execute("SELECT 1 FROM downloads WHERE id=?", (download_id,)).fetchone():
+        return False
+    for author in authors:
+        if not isinstance(author, dict) or not all(author.get(k) for k in ("platform", "identity_key", "role")):
+            continue
+        if author["role"] not in ("creator", "artist", "uploader"):
+            continue
+        conn.execute(
+            """INSERT INTO authors(platform,identity_key,external_id,username,name,profile_url)
+               VALUES (?,?,?,?,?,?) ON CONFLICT(platform,identity_key) DO UPDATE SET
+               external_id=CASE WHEN excluded.external_id!='' THEN excluded.external_id ELSE authors.external_id END,
+               username=CASE WHEN excluded.username!='' THEN excluded.username ELSE authors.username END,
+               name=CASE WHEN excluded.name!='' AND (excluded.name!=excluded.username OR authors.name='' OR authors.name=authors.username)
+                         THEN excluded.name ELSE authors.name END,
+               profile_url=CASE WHEN excluded.profile_url!='' THEN excluded.profile_url ELSE authors.profile_url END""",
+            tuple(str(author.get(k) or "") for k in ("platform", "identity_key", "external_id", "username", "name", "profile_url")),
+        )
+        author_id = conn.execute("SELECT id FROM authors WHERE platform=? AND identity_key=?",
+                                 (author["platform"], author["identity_key"])).fetchone()[0]
+        conn.execute(
+            """INSERT INTO download_authors(download_id,author_id,role,source) VALUES (?,?,?,?)
+               ON CONFLICT(download_id,author_id,role) DO UPDATE SET source=excluded.source""",
+            (download_id, author_id, author["role"], source),
+        )
+    if conn.execute("SELECT 1 FROM download_authors WHERE download_id=? LIMIT 1", (download_id,)).fetchone():
+        conn.execute("UPDATE downloads SET author_status='resolved',author_checked_at=?,author_error='' WHERE id=?",
+                     (datetime.now().isoformat(), download_id))
+    return True
+
+
+def set_download_authors(download_id: int, authors: list[dict], source: str):
+    with get_db() as conn:
+        return _merge_download_authors(conn, download_id, authors, source)
+
+
+def set_author_batch(records: list[dict]):
+    """One transaction per migration batch, avoiding a disk sync for every author."""
+    with get_db() as conn:
+        for record in records:
+            _merge_download_authors(conn, record["id"], record["authors"], record["source"])
+
+
+def mark_author_check(download_id: int, error: str = "no_author_in_metadata"):
+    with get_db() as conn:
+        conn.execute("""UPDATE downloads SET author_status='unavailable',author_checked_at=?,author_error=?
+                        WHERE id=? AND NOT EXISTS (SELECT 1 FROM download_authors WHERE download_id=downloads.id)""",
+                     (datetime.now().isoformat(), error, download_id))
 
 
 def _row_to_entry(conn: sqlite3.Connection, row: sqlite3.Row) -> dict:
     """Збирає повний dict-запис (сумісний зі старим форматом) з нормалізованих таблиць."""
     did = row["id"]
+    authors = _author_rows(conn, did)
 
     zip_parts_rows = conn.execute(
         "SELECT path FROM zip_parts WHERE download_id=? ORDER BY part_number", (did,)
@@ -348,6 +443,12 @@ def _row_to_entry(conn: sqlite3.Connection, row: sqlite3.Row) -> dict:
         "_id":              did,
         "media_kind":       row["media_kind"],
         "owner_chat_id":    row["owner_chat_id"],
+        "authors":          authors,
+        "author":           ", ".join(dict.fromkeys(a["name"] for a in authors if a["role"] != "uploader"))
+                            or ", ".join(dict.fromkeys(a["name"] for a in authors)),
+        "author_status":    row["author_status"],
+        "author_checked_at": row["author_checked_at"],
+        "author_error":     row["author_error"],
         "url":              row["url"],
         "gallery_name":     row["gallery_name"],
         "image_count":      row["image_count"],

@@ -164,6 +164,23 @@ class AnimationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(options[0]["keep-files"])
         self.assertTrue(launch.await_args.kwargs["start_new_session"])
 
+    async def test_gallery_author_metadata_is_saved_without_entering_logs(self):
+        self.module.pixiv_auth.save_token(123, "synthetic-token")
+        stdout, stderr = asyncio.StreamReader(), asyncio.StreamReader()
+        stdout.feed_data(json.dumps({"category": "pixiv", "user": {
+            "id": 42, "name": "Private Display Name", "account": "nick"}}).encode() + b"\n")
+        stdout.feed_eof()
+        stderr.feed_eof()
+        process = SimpleNamespace(returncode=0, wait=AsyncMock(return_value=0), stdout=stdout, stderr=stderr)
+        with patch.object(self.module.asyncio, "create_subprocess_exec", AsyncMock(return_value=process)), \
+                patch.object(self.module.logging, "info") as log:
+            await self.module.run_download(self.message, "https://www.pixiv.net/en/artworks/123", self.index, self.folder)
+        entry = db.load_history()[self.index]
+        self.assertEqual(entry["author"], "Private Display Name")
+        self.assertNotIn("Private Display Name", str(log.call_args_list))
+        sidecar = self.module.ARCHIVE_DIR / "metadata" / f"download-{entry['_id']}.authors.json"
+        self.assertEqual(json.loads(sidecar.read_text())["authors"][0]["external_id"], "42")
+
     @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "FFmpeg required")
     async def test_real_ugoira_conversion_preserves_timing_and_source(self):
         source = self.folder / "animation.zip"

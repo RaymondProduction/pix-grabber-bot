@@ -3,6 +3,7 @@
 import asyncio
 import contextlib
 import json
+import logging
 import os
 import re
 import signal
@@ -13,6 +14,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 from media_support import DownloadActivity
+from author_metadata import YTDLP_AUTHOR_FIELDS, extract_authors, write_author_sidecar
 
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".webm", ".mov", ".m4v"}
 MANIFEST = "videos.json"
@@ -142,7 +144,8 @@ def download_command(url: str, folder: Path, cookies: Path | None, max_bytes: in
             "-o", "%(id)s_%(title).80B.%(ext)s", "-S", "res:1080",
             "-f", "bv*[vcodec^=avc1][ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b",
             "--merge-output-format", "mp4/mkv",
-            "--print", 'after_move:%(.{filepath,title,id,duration,width,height})j']
+            "--print", 'before_dl:%(.{' + YTDLP_AUTHOR_FIELDS + '})j',
+            "--print", 'after_move:%(.{filepath,title,id,duration,width,height,' + YTDLP_AUTHOR_FIELDS + '})j']
     if platform == "youtube":
         deno = shutil.which("deno")
         if not deno:
@@ -155,7 +158,7 @@ def download_command(url: str, folder: Path, cookies: Path | None, max_bytes: in
 
 async def download_video(url: str, folder: Path, cookies: bytes | None, *,
                          timeout: int = 1800, stall_timeout: int = 300,
-                         max_bytes: int = 2 * 1024 ** 3):
+                         max_bytes: int = 2 * 1024 ** 3, on_authors=None):
     folder.mkdir(parents=True, exist_ok=True)
     # Cookies never enter the persistent video tree. yt-dlp may rewrite its cookie jar.
     with tempfile.TemporaryDirectory(prefix="pix-video-session-") as private_dir:
@@ -171,6 +174,7 @@ async def download_video(url: str, folder: Path, cookies: bytes | None, *,
         activity = DownloadActivity(loop.time())
         errors = bytearray()
         completed = 0
+        known_authors = {}
 
         async def output():
             nonlocal completed
@@ -178,6 +182,18 @@ async def download_video(url: str, folder: Path, cookies: bytes | None, *,
                 activity.touch(loop.time())
                 try:
                     info = json.loads(line)
+                    authors = extract_authors(info, url)
+                    for author in authors:
+                        known_authors[(author["platform"], author["identity_key"], author["role"])] = author
+                    if authors:
+                        if on_authors:
+                            on_authors(authors)
+                        try:
+                            write_author_sidecar(folder / "authors.json", url, list(known_authors.values()))
+                        except OSError:
+                            logging.warning("Could not write video author sidecar")
+                    if "filepath" not in info:
+                        continue
                     path = Path(info["filepath"])
                     if (path.is_symlink() or path.resolve().parent != folder.resolve()
                             or path.suffix.lower() not in VIDEO_EXTENSIONS or not path.is_file()
@@ -185,7 +201,7 @@ async def download_video(url: str, folder: Path, cookies: bytes | None, *,
                         continue
                     save_video(folder, {"file": path.name, "title": str(info.get("title") or path.stem),
                                         "duration": info.get("duration"), "width": info.get("width"),
-                                        "height": info.get("height")})
+                                        "height": info.get("height"), "authors": authors})
                     completed += 1
                 except (ValueError, KeyError, TypeError):
                     continue
