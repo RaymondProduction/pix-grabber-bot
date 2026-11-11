@@ -2,6 +2,7 @@ import asyncio
 import functools
 import http.server
 import importlib.util
+import io
 import json
 import os
 import shutil
@@ -10,6 +11,7 @@ import sys
 import threading
 import tempfile
 import unittest
+import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -23,6 +25,7 @@ from yt_dlp.cookies import YoutubeDLCookieJar
 import db
 import video_auth as auth
 import video_support as video
+from video_delivery import VideoDeliveryError
 from test_pixiv_auth import RecordingSession
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -153,7 +156,7 @@ class RoutingStorageTests(unittest.TestCase):
         with patch.object(video.shutil, "which", return_value="/runtime/deno"):
             options = parse_options(video.download_command(URLS[3], Path("output"), None, 1024)[3:]).ydl_opts
         self.assertEqual(options["js_runtimes"]["deno"]["path"], "/runtime/deno")
-        self.assertEqual(options["format_sort"], ["res:720"])
+        self.assertEqual(options["format_sort"], ["res:1080"])
         with patch.object(video.shutil, "which", return_value=None):
             with self.assertRaises(video.VideoDownloadError) as raised:
                 video.download_command(URLS[3], Path("output"), None, 1024)
@@ -387,6 +390,18 @@ class VideoBotTests(unittest.IsolatedAsyncioTestCase):
         (folder / "clip.mp4").write_bytes(b"synthetic-video-with-audio")
         video.save_video(folder, {"file": "clip.mp4", "title": "Clip <title>"})
 
+    def large_video_entry(self):
+        index, folder = self.video_entry(status="done", image_count=1)
+        folder.mkdir(parents=True)
+        (folder / "clip.mp4").write_bytes(os.urandom(11000))
+        video.save_video(folder, {"file": "clip.mp4", "title": "Large <video>"})
+        return index, folder
+
+    async def fake_preview(self, source, folder):
+        preview = folder / "preview.mp4"
+        preview.write_bytes(b"small-preview")
+        return preview
+
     async def download(self, url=URLS[0], failure=None):
         message, url, download_id, folder = self.enqueue(url)
         index = db.find_history_index_by_id(download_id)
@@ -434,6 +449,148 @@ class VideoBotTests(unittest.IsolatedAsyncioTestCase):
             await self.module.send_existing_archive_from_history(self.message, index)
         self.message.answer_video.assert_not_awaited()
         self.assertTrue((folder / "clip.mp4").exists())
+
+    async def test_large_video_sends_preview_and_lossless_volumes_on_ssd(self):
+        index, folder = self.large_video_entry()
+        original = (folder / "clip.mp4").read_bytes()
+        events = []
+
+        async def uploaded(file, **kwargs):
+            path = Path(file.path)
+            events.append(path)
+            return SimpleNamespace(chat=SimpleNamespace(id=123), message_id=len(events) + 100)
+
+        self.message.answer_video.side_effect = uploaded
+        self.message.answer_document.side_effect = uploaded
+        with patch.object(self.module, "MAX_DOCUMENT_UPLOAD_SIZE", 4096), \
+                patch.object(self.module, "MAX_ARCHIVE_PART_SIZE", 3000), \
+                patch.object(self.module, "create_video_preview", side_effect=self.fake_preview):
+            sent = await self.module.send_saved_videos(self.message, index, db.load_history()[index])
+        self.assertEqual(sent, 1)
+        self.assertEqual(events[0].name, "preview.mp4")
+        parts = events[1:]
+        self.assertEqual(len(parts), 4)
+        self.assertTrue(all(part.stat().st_size <= 3000 for part in parts))
+        self.assertTrue(all(self.ssd.resolve() in part.resolve().parents for part in parts))
+        with zipfile.ZipFile(io.BytesIO(b"".join(part.read_bytes() for part in parts))) as archive:
+            self.assertEqual(archive.read("clip.mp4"), original)
+        entry = db.load_history()[index]
+        self.assertEqual((entry["status"], entry["image_count"], entry["zip_parts"]), ("done", 1, []))
+        self.assertEqual(len([ref for ref in entry["image_messages"] if ref["kind"] == "video_part"]), 4)
+        self.assertEqual(entry["preview_message"]["message_id"], 101)
+        self.assertEqual((folder / "clip.mp4").read_bytes(), original)
+
+    async def test_failed_middle_part_retries_from_disk_without_losing_later_parts(self):
+        index, folder = self.large_video_entry()
+        failed_once = False
+
+        async def uploaded(file, **kwargs):
+            nonlocal failed_once
+            number = int(Path(file.path).suffix[1:])
+            if number == 2 and not failed_once:
+                failed_once = True
+                raise TelegramBadRequest(method=SendVideo(chat_id=123, video="test"), message="temporary failure")
+            return SimpleNamespace(chat=SimpleNamespace(id=123), message_id=100 + number)
+
+        self.message.answer_document.side_effect = uploaded
+        with patch.object(self.module, "MAX_DOCUMENT_UPLOAD_SIZE", 4096), \
+                patch.object(self.module, "MAX_ARCHIVE_PART_SIZE", 3000), \
+                patch.object(self.module, "create_video_preview", side_effect=self.fake_preview) as preview:
+            sent = await self.module.send_saved_videos(self.message, index, db.load_history()[index])
+            self.assertEqual(sent, 0)
+            entry = db.load_history()[index]
+            refs = [ref for ref in entry["image_messages"] if ref["kind"] == "video_part"]
+            self.assertEqual([Path(ref["file_name"]).name for ref in refs],
+                             ["clip.mp4.zip.001", "clip.mp4.zip.003", "clip.mp4.zip.004"])
+            self.assertEqual(entry["status"], "done")
+            db.init_db()
+            self.message.answer_document.reset_mock()
+            with patch.object(self.module.bot, "forward_message", AsyncMock()) as forward:
+                sent = await self.module.send_saved_videos(self.message, index, entry)
+            self.assertEqual(sent, 1)
+            self.assertEqual(forward.await_count, 4)  # Preview and three previously delivered parts.
+            self.message.answer_document.assert_awaited_once()
+            self.assertEqual(Path(self.message.answer_document.await_args.args[0].path).name, "clip.mp4.zip.002")
+            self.assertEqual(preview.await_count, 1)
+        self.assertTrue((folder / "clip.mp4").exists())
+
+    async def test_preview_failure_does_not_prevent_original_delivery(self):
+        index, _ = self.large_video_entry()
+        with patch.object(self.module, "MAX_DOCUMENT_UPLOAD_SIZE", 4096), \
+                patch.object(self.module, "MAX_ARCHIVE_PART_SIZE", 3000), \
+                patch.object(self.module, "create_video_preview", side_effect=VideoDeliveryError("Preview failed")):
+            self.assertEqual(await self.module.send_saved_videos(self.message, index, db.load_history()[index]), 1)
+        self.message.answer_video.assert_not_awaited()
+        self.assertEqual(self.message.answer_document.await_count, 4)
+
+    async def test_document_button_sends_original_instead_of_forwarding_video(self):
+        index, folder = await self.download()
+        self.message.answer_video.reset_mock()
+        callback = SimpleNamespace(data=f"video_document:{index}", message=self.message, answer=AsyncMock())
+        with patch.object(self.module.bot, "forward_message", AsyncMock()) as forward:
+            await self.module.video_document_callback(callback)
+        forward.assert_not_awaited()
+        self.message.answer_video.assert_not_awaited()
+        self.message.answer_document.assert_awaited_once()
+        self.assertEqual(Path(self.message.answer_document.await_args.args[0].path), folder / "clip.mp4")
+        self.assertIn("video_document", {ref["kind"] for ref in db.load_history()[index]["image_messages"]})
+
+    async def test_document_callback_dispatch_cannot_access_another_chat(self):
+        index, _ = self.large_video_entry()
+        self.module.bot.session = RecordingSession()
+        user = User(id=456, is_bot=False, first_name="Other")
+        message = Message(message_id=1, date=datetime.now(timezone.utc), chat=Chat(id=456, type="private"), from_user=user)
+        update = Update(update_id=1, callback_query=CallbackQuery(
+            id="test", from_user=user, chat_instance="test", message=message, data=f"video_document:{index}"))
+        with patch.object(self.module, "send_saved_videos", AsyncMock()) as send:
+            await self.module.dp.feed_update(self.module.bot, update)
+        send.assert_not_awaited()
+
+    async def test_telegram_size_rejection_falls_back_to_parts_even_below_configured_limit(self):
+        index, _ = self.large_video_entry()
+        error = TelegramEntityTooLarge(method=SendVideo(chat_id=123, video="test"), message="too large")
+        self.message.answer_video.side_effect = error
+
+        async def uploaded(file, **kwargs):
+            if Path(file.path).suffix == ".mp4":
+                raise error
+            return SimpleNamespace(chat=SimpleNamespace(id=123), message_id=100)
+
+        self.message.answer_document.side_effect = uploaded
+        with patch.object(self.module, "MAX_ARCHIVE_PART_SIZE", 3000), \
+                patch.object(self.module, "create_video_preview", side_effect=self.fake_preview):
+            self.assertEqual(await self.module.send_saved_videos(self.message, index, db.load_history()[index]), 1)
+        self.assertEqual(self.message.answer_document.await_count, 5)
+        self.assertEqual(db.load_history()[index]["status"], "done")
+
+    async def test_concurrent_resends_share_preparation_and_reuse_telegram_parts(self):
+        index, _ = self.large_video_entry()
+        entry = db.load_history()[index]
+        with patch.object(self.module, "MAX_DOCUMENT_UPLOAD_SIZE", 4096), \
+                patch.object(self.module, "MAX_ARCHIVE_PART_SIZE", 3000), \
+                patch.object(self.module, "create_video_preview", side_effect=self.fake_preview), \
+                patch.object(self.module.bot, "forward_message", AsyncMock()) as forward:
+            counts = await asyncio.gather(
+                self.module.send_saved_videos(self.message, index, entry),
+                self.module.send_saved_videos(self.message, index, entry))
+        self.assertEqual(counts, [1, 1])
+        self.assertEqual(self.message.answer_document.await_count, 4)
+        self.assertEqual(forward.await_count, 5)
+
+    async def test_changing_part_size_never_mixes_telegram_volume_generations(self):
+        index, _ = self.large_video_entry()
+        with patch.object(self.module, "MAX_DOCUMENT_UPLOAD_SIZE", 4096), \
+                patch.object(self.module, "create_video_preview", side_effect=self.fake_preview), \
+                patch.object(self.module.bot, "forward_message", AsyncMock()) as forward:
+            for limit, expected_parts in ((3000, 4), (2000, 6), (3000, 4)):
+                self.message.answer_document.reset_mock()
+                with patch.object(self.module, "MAX_ARCHIVE_PART_SIZE", limit):
+                    await self.module.send_saved_videos(self.message, index, db.load_history()[index])
+                self.assertEqual(self.message.answer_document.await_count, expected_parts)
+                refs = [ref for ref in db.load_history()[index]["image_messages"] if ref["kind"] == "video_part"]
+                self.assertEqual(len(refs), expected_parts)
+                self.assertEqual(len({Path(ref["file_name"]).parent for ref in refs}), 1)
+        forward.assert_not_awaited()
 
     async def test_auth_failure_keeps_resume_and_does_not_publish_partial_mp4(self):
         async def fail(url, folder, cookie_data, **kwargs):

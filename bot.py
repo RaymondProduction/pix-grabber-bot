@@ -25,7 +25,7 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
-from aiogram.exceptions import TelegramAPIError
+from aiogram.exceptions import TelegramAPIError, TelegramEntityTooLarge
 from aiogram import F
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
@@ -33,6 +33,7 @@ import db
 from pixiv_auth import PixivAuth, PixivAuthError, is_oauth_response, is_pixiv_url
 from media_support import ANIMATION_EXTENSIONS, PIXIV_POSTPROCESSORS, DownloadActivity, probe_animation
 from video_auth import VideoAuth, VideoAuthError, PLATFORMS, COOKIE_LIMIT
+from video_delivery import VideoDeliveryError, prepare_video_parts, create_video_preview
 from video_support import (
     VideoDownloadError, video_platform, video_root, ensure_video_storage,
     saved_videos, download_video,
@@ -52,6 +53,8 @@ BASE_DOWNLOAD_DIR = Path("images")
 BASE_DOWNLOAD_DIR.mkdir(exist_ok=True)
 VIDEO_DOWNLOAD_DIR = video_root(BASE_DOWNLOAD_DIR, CONFIG.get("video_download_dir", ""))
 MAX_VIDEO_UPLOAD_SIZE = int(CONFIG.get("max_video_upload_size_mb", 49)) * 1024 * 1024
+MAX_DOCUMENT_UPLOAD_SIZE = int(CONFIG.get("max_document_upload_size_mb", 49)) * 1024 * 1024
+video_delivery_lock = asyncio.Lock()
 
 ARCHIVE_DIR = Path("arhive")
 ARCHIVE_DIR.mkdir(exist_ok=True)
@@ -421,7 +424,7 @@ def visible_history(chat_id: int) -> list[dict]:
 
 @dp.callback_query.outer_middleware()
 async def protect_video_history(handler, event, data):
-    prefixes = {"history_item", "resend", "all_photos", "partial", "resume", "get_url",
+    prefixes = {"history_item", "resend", "video_document", "all_photos", "partial", "resume", "get_url",
                 "delete_history_item", "archive_item"}
     prefix, _, value = (event.data or "").partition(":")
     if prefix in prefixes:
@@ -434,7 +437,8 @@ async def protect_video_history(handler, event, data):
 
 
 def build_video_history_keyboard(index: int, entry: dict) -> InlineKeyboardMarkup:
-    buttons = [[InlineKeyboardButton(text="🎬 Надіслати відео", callback_data=f"resend:{index}")]]
+    buttons = [[InlineKeyboardButton(text="🎬 Надіслати відео", callback_data=f"resend:{index}")],
+               [InlineKeyboardButton(text="📄 Надіслати файлом", callback_data=f"video_document:{index}")]]
     if entry.get("status") == "interrupted":
         buttons.append([InlineKeyboardButton(text="⏩ Докачати", callback_data=f"resume:{index}")])
         platform = video_platform(entry.get("url", ""))
@@ -514,43 +518,130 @@ async def suggest_video_login(message, platform: str, *, required: bool):
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[video_login_button(message.chat.id, platform)]]))
 
 
-async def send_saved_videos(message, index: int, entry: dict):
+async def forward_video_reference(message, ref: dict | None) -> bool:
+    if not ref:
+        return False
+    try:
+        await bot.forward_message(chat_id=message.chat.id, from_chat_id=int(ref["chat_id"]),
+                                  message_id=int(ref["message_id"]))
+        return True
+    except TelegramAPIError:
+        return False
+
+
+async def send_video_parts(message, entry: dict, path: Path, title: str) -> bool:
+    await message.answer(f"📦 Готую оригінал <b>{html.escape(title[:300])}</b> частинами архіву…")
+    limit = min(MAX_ARCHIVE_PART_SIZE, MAX_DOCUMENT_UPLOAD_SIZE)
+    parts, reused = await prepare_video_parts(path, limit)
+    download_id = entry["_id"]
+    if db.find_history_index_by_id(download_id) is None:
+        return False
+    generation = parts[0].parent.name
+    db.clear_video_delivery_messages(download_id, path.name, keep_generation=generation if reused else None)
+    current = db.load_history()[db.find_history_index_by_id(download_id)]
+    refs = {(ref["kind"], ref["file_name"]): ref for ref in get_image_messages(current)}
+    preview_ref = refs.get(("video_preview", f"{generation}/{path.name}"))
+    if not await forward_video_reference(message, preview_ref):
+        try:
+            preview = await create_video_preview(path, parts[0].parent)
+            if db.find_history_index_by_id(download_id) is None:
+                return False
+            sent = await message.answer_video(
+                types.FSInputFile(preview), supports_streaming=True, request_timeout=180,
+                caption=f"🎬 Прев’ю: перші 15 с, зменшена якість.\n{html.escape(title[:300])}\n"
+                        "Повне відео в оригінальній якості — у частинах архіву нижче.")
+            if db.find_history_index_by_id(download_id) is None:
+                return False
+            db.append_image_message(download_id, f"{generation}/{path.name}", str(sent.chat.id), sent.message_id,
+                                    kind="video_preview")
+            if not current.get("preview_message") or preview_ref:
+                db.set_preview_message(download_id, str(sent.chat.id), sent.message_id)
+        except (VideoDeliveryError, TelegramAPIError):
+            await message.answer("⚠️ Прев’ю недоступне. Надсилаю повний оригінал частинами архіву.")
+    await message.answer(
+        f"📦 Частин архіву: <b>{len(parts)}</b>, кожна до {limit / 1024 ** 2:g} МіБ.\n"
+        "Збережи всі частини в одну папку та відкрий файл <code>.zip.001</code> у 7-Zip. "
+        "Частини потрібно розпаковувати разом; усередині — повне відео без змін.")
+    sent_count = 0
+    for number, part in enumerate(parts, 1):
+        if db.find_history_index_by_id(download_id) is None:
+            return False
+        reference_name = f"{generation}/{part.name}"
+        ref = refs.get(("video_part", reference_name))
+        if await forward_video_reference(message, ref):
+            sent_count += 1
+            continue
+        try:
+            sent = await message.answer_document(
+                types.FSInputFile(part), caption=f"📦 {html.escape(title[:300])} — частина {number}/{len(parts)}",
+                request_timeout=180)
+            if db.find_history_index_by_id(download_id) is None:
+                return False
+            db.append_image_message(download_id, reference_name, str(sent.chat.id), sent.message_id, kind="video_part")
+            sent_count += 1
+        except TelegramAPIError:
+            # Every successful part has its own stable name, so a failed middle part
+            # cannot shift the correspondence between files and Telegram messages.
+            continue
+    if sent_count < len(parts):
+        await message.answer(f"⚠️ Надіслано частин: {sent_count}/{len(parts)}. "
+                             "Усі частини й оригінал залишилися на SSD. Повтори надсилання з історії.")
+    return sent_count == len(parts)
+
+
+async def send_saved_videos(message, index: int, entry: dict, *, as_document: bool = False):
     if not can_access_entry(entry, message.chat.id):
         await message.answer("Запис не знайдено в цьому чаті.")
         return
+    async with video_delivery_lock:
+        current_index = db.find_history_index_by_id(entry["_id"])
+        if current_index is None:
+            return 0
+        entry = db.load_history()[current_index]
+        if not can_access_entry(entry, message.chat.id):
+            return 0
+        return await deliver_saved_videos(message, entry, as_document=as_document)
+
+
+async def deliver_saved_videos(message, entry: dict, *, as_document: bool):
     folder = Path(entry["download_dir"])
     items = saved_videos(folder)
-    messages = {ref["file_name"]: ref for ref in get_image_messages(entry)}
+    references = get_image_messages(entry)
+    messages = {ref["file_name"]: ref for ref in references
+                if ref["kind"] in (("video_document",) if as_document else ("video", "video_document"))}
     # Telegram can still hold the video when the SSD is temporarily offline.
     if not items:
         items = [{"file": name, "title": entry["gallery_name"]} for name in messages]
+        part_refs = [ref for ref in references if ref["kind"] == "video_part"]
+        if part_refs:
+            await message.answer("💾 SSD або опис відео недоступний. Пересилаю збережені в Telegram частини; "
+                                 "якщо раніше надсилання перервалося, тут можуть бути не всі частини.")
+            for ref in references:
+                if ref["kind"] in ("video_preview", "video_part"):
+                    await forward_video_reference(message, ref)
     sent_count = 0
     for item in items:
         ref = messages.get(item["file"])
-        if ref:
-            try:
-                await bot.forward_message(chat_id=message.chat.id, from_chat_id=int(ref["chat_id"]),
-                                          message_id=int(ref["message_id"]))
-                sent_count += 1
-                continue
-            except TelegramAPIError:
-                pass
+        if await forward_video_reference(message, ref):
+            sent_count += 1
+            continue
         path = folder / item["file"]
         if not path.is_file() or path.is_symlink():
             await message.answer(f"⚠️ Файл недоступний на диску: <code>{html.escape(path.name)}</code>.")
             continue
-        if path.stat().st_size > MAX_VIDEO_UPLOAD_SIZE:
-            await message.answer(
-                f"💾 Відео збережено: <code>{html.escape(str(path))}</code>\n"
-                f"Розмір {path.stat().st_size / 1024 ** 2:.1f} МіБ перевищує ліміт надсилання бота "
-                f"({MAX_VIDEO_UPLOAD_SIZE / 1024 ** 2:g} МіБ). Оригінал залишається на диску.")
-            continue
+        title = str(item.get("title") or path.stem)
+        size = path.stat().st_size
         caption = html.escape(str(item.get("title") or path.stem)[:300])
         try:
-            if path.suffix.lower() == ".mp4":
+            if size > MAX_DOCUMENT_UPLOAD_SIZE:
+                sent_count += await send_video_parts(message, entry, path, title)
+                continue
+            kind = "video_document"
+            if not as_document and path.suffix.lower() == ".mp4" and size <= MAX_VIDEO_UPLOAD_SIZE:
                 try:
                     sent = await message.answer_video(types.FSInputFile(path), caption=caption,
                                                        supports_streaming=True, request_timeout=180)
+                    kind = "video"
                 except TelegramAPIError:
                     sent = await message.answer_document(types.FSInputFile(path), caption=caption,
                                                           request_timeout=180)
@@ -559,13 +650,20 @@ async def send_saved_videos(message, index: int, entry: dict):
                                                       request_timeout=180)
             if db.find_history_index_by_id(entry["_id"]) is None:
                 return sent_count
-            db.append_image_message(entry["_id"], path.name, str(sent.chat.id), sent.message_id, kind="video")
-            if not entry.get("preview_message"):
+            db.append_image_message(entry["_id"], path.name, str(sent.chat.id), sent.message_id, kind=kind)
+            if kind == "video" and not entry.get("preview_message"):
                 db.set_preview_message(entry["_id"], str(sent.chat.id), sent.message_id)
             sent_count += 1
+        except TelegramEntityTooLarge:
+            try:
+                sent_count += await send_video_parts(message, entry, path, title)
+            except VideoDeliveryError as exc:
+                await message.answer(f"⚠️ {html.escape(str(exc))}")
+        except VideoDeliveryError as exc:
+            await message.answer(f"⚠️ {html.escape(str(exc))}")
         except TelegramAPIError:
             await message.answer("⚠️ Telegram не прийняв відео. Оригінал збережено; повтори надсилання з історії.")
-    if not items:
+    if not items and not any(ref["kind"] == "video_part" for ref in references):
         await message.answer("Збережених відео поки немає. Можна повторити завантаження.",
                              reply_markup=build_redownload_keyboard(entry["url"], message.chat.id))
     return sent_count
@@ -2948,6 +3046,18 @@ async def grab_pending_callback(callback: types.CallbackQuery):
 @dp.message(Command("grab_pending"))
 async def cmd_grab_pending(message: types.Message):
     await grab_pending_downloads(message)
+
+
+@dp.callback_query(F.data.startswith("video_document:"))
+async def video_document_callback(callback: types.CallbackQuery):
+    index = int(callback.data.split(":", 1)[1])
+    history = db.load_history()
+    if (index < 0 or index >= len(history) or history[index].get("media_kind") != "video"
+            or not can_access_entry(history[index], callback.message.chat.id)):
+        await callback.answer("Запис не знайдено в цьому чаті.", show_alert=True)
+        return
+    await callback.answer()
+    await send_saved_videos(callback.message, index, history[index], as_document=True)
 
 
 @dp.callback_query(F.data.startswith("resend:"))

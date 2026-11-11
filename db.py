@@ -677,6 +677,24 @@ def append_image_message(download_id: int, file_name: str, chat_id: str, message
         )
 
 
+def clear_video_delivery_messages(download_id: int, file_name: str, *, keep_generation: str | None = None):
+    """Never mix Telegram volumes prepared from different sources or part sizes."""
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT id, file_name, kind, chat_id, message_id FROM image_messages WHERE download_id=?",
+            (download_id,),
+        ).fetchall()
+        for row in rows:
+            name = Path(row["file_name"]).name
+            if keep_generation and row["file_name"].startswith(keep_generation + "/"):
+                continue
+            if ((row["kind"] == "video_part" and name.startswith(file_name + ".zip."))
+                    or (row["kind"] == "video_preview" and name == file_name)):
+                conn.execute("DELETE FROM image_messages WHERE id=?", (row["id"],))
+                conn.execute("DELETE FROM preview_messages WHERE download_id=? AND chat_id=? AND message_id=?",
+                             (download_id, row["chat_id"], row["message_id"]))
+
+
 def set_preview_message(download_id: int, chat_id: str, message_id: int):
     with get_db() as conn:
         existing = conn.execute(

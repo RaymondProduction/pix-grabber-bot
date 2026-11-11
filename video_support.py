@@ -139,7 +139,7 @@ def download_command(url: str, folder: Path, cookies: Path | None, max_bytes: in
             "--no-playlist", "--playlist-end", "10", "--socket-timeout", "30",
             "--retries", "2", "--fragment-retries", "2", "--max-filesize", str(max_bytes),
             "--restrict-filenames", "--no-overwrites", "-P", str(folder.resolve()),
-            "-o", "%(id)s_%(title).80B.%(ext)s", "-S", "res:720" if platform == "youtube" else "res:1080",
+            "-o", "%(id)s_%(title).80B.%(ext)s", "-S", "res:1080",
             "-f", "bv*[vcodec^=avc1][ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b",
             "--merge-output-format", "mp4/mkv",
             "--print", 'after_move:%(.{filepath,title,id,duration,width,height})j']
