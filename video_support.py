@@ -17,10 +17,44 @@ MANIFEST = "videos.json"
 
 
 class VideoDownloadError(RuntimeError):
-    def __init__(self, message: str, *, needs_login: bool = False, not_video: bool = False):
+    def __init__(self, message: str, *, needs_login: bool = False, not_video: bool = False,
+                 suggest_login: bool = False):
         super().__init__(message)
         self.needs_login = needs_login
         self.not_video = not_video
+        self.suggest_login = suggest_login or needs_login
+
+
+def classify_download_error(stderr: str) -> VideoDownloadError:
+    """Offer an account for ambiguous site responses without claiming login is required."""
+    error = stderr.lower()
+    if "no module named yt_dlp" in error:
+        return VideoDownloadError("На сервері потрібно встановити залежності: pip install -r requirements.txt.")
+    if "there is no video in this post" in error:
+        return VideoDownloadError("У цьому дописі немає відео.", not_video=True)
+    if any(s in error for s in ("log in", "login", "sign in", "sign-in", "logged in", "logged-in",
+                                "cookies", "checkpoint", "authentication required", "registered users",
+                                "session has expired", "http error 401", "unauthorized")):
+        return VideoDownloadError(
+            "Сервіс просить авторизацію. Підключи або онови cookies та повтори завантаження.",
+            needs_login=True)
+    if any(s in error for s in ("no space left", "disk quota exceeded", "read-only file system",
+                                "permission denied")):
+        return VideoDownloadError("Не вдалося записати відео на диск. Перевір вільне місце та права доступу до сховища.")
+    if any(s in error for s in ("timed out", "timeout", "temporary failure in name resolution",
+                                "name or service not known", "failed to resolve", "unable to resolve",
+                                "connection refused", "connection reset", "certificate verify failed",
+                                "network is unreachable")):
+        return VideoDownloadError("Не вдалося з’єднатися із сайтом. Спробуй докачати відео пізніше.")
+    if any(s in error for s in ("max-filesize", "file is too large")):
+        return VideoDownloadError("Відео перевищує налаштований ліміт розміру завантаження.")
+    if "unsupported url" in error:
+        return VideoDownloadError("Це посилання не підтримується. Спробуй пряму адресу відео або Reel.")
+    # Facebook's 'Cannot parse data', 403 and generic unavailable responses do not
+    # reliably distinguish a login wall, a deleted post and an extractor failure.
+    return VideoDownloadError(
+        "Не вдалося отримати відео. Сайт міг обмежити доступ або змінити відповідь.",
+        suggest_login=True)
 
 
 def video_platform(url: str) -> str | None:
@@ -162,14 +196,7 @@ async def download_video(url: str, folder: Path, cookies: bytes | None, *,
             await asyncio.gather(*readers)
             if waiter.result() != 0 or not completed:
                 # Do not expose extractor output: it may contain signed URLs or cookies.
-                error = errors.decode(errors="replace").lower()
-                needs_login = any(s in error for s in ("log in", "login", "sign in", "cookies", "checkpoint"))
-                if "no module named yt_dlp" in error:
-                    raise VideoDownloadError("На сервері потрібно встановити залежності: pip install -r requirements.txt.")
-                raise VideoDownloadError(
-                    "Сервіс просить авторизацію. Підключи або онови cookies та повтори завантаження."
-                    if needs_login else "Не вдалося завантажити відео. Воно може бути недоступним, завеликим або сервіс обмежує запити.",
-                    needs_login=needs_login, not_video="there is no video in this post" in error)
+                raise classify_download_error(errors.decode(errors="replace"))
         finally:
             # Stop ffmpeg children as well as yt-dlp on timeout/cancellation.
             with contextlib.suppress(ProcessLookupError):

@@ -437,12 +437,35 @@ def build_video_history_keyboard(index: int, entry: dict) -> InlineKeyboardMarku
     buttons = [[InlineKeyboardButton(text="🎬 Надіслати відео", callback_data=f"resend:{index}")]]
     if entry.get("status") == "interrupted":
         buttons.append([InlineKeyboardButton(text="⏩ Докачати", callback_data=f"resume:{index}")])
+        platform = video_platform(entry.get("url", ""))
+        if platform and int(entry.get("owner_chat_id") or 0) > 0:
+            buttons.append([video_login_button(int(entry["owner_chat_id"]), platform)])
     buttons.extend([
         [InlineKeyboardButton(text="🔗 Отримати посилання", callback_data=f"get_url:{index}")],
         [InlineKeyboardButton(text="🗑 Видалити з історії", callback_data=f"delete_history_item:{index}")],
         [InlineKeyboardButton(text="⬅️ До історії", callback_data="show_history")],
     ])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def video_login_button(chat_id: int, platform: str) -> InlineKeyboardButton:
+    action = "Оновити cookies" if video_auth.path(chat_id, platform).exists() else "Підключити"
+    return InlineKeyboardButton(text=f"🔐 {action} {PLATFORMS[platform]}", callback_data=f"video_login:{platform}")
+
+
+async def suggest_video_login(message, platform: str, *, required: bool):
+    if message.chat.id <= 0:
+        await message.answer(
+            f"🔐 Підключення {PLATFORMS[platform]} доступне в особистому чаті: /{platform}_login.\n"
+            "Після підключення надішли посилання там. У групах завантаження працює без акаунта.")
+        return
+    explanation = ("Підключи акаунт або онови його cookies. " if required else
+                   "Можеш спробувати підключити акаунт або оновити cookies. "
+                   "Це може допомогти, якщо сайт вимагає вхід; точну причину відмови визначити не вдалося. ")
+    await message.answer(
+        f"🔐 {explanation}\nНатисни кнопку нижче або надішли /{platform}_login.\n"
+        "Після імпорту cookies натисни «Докачати» в історії.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[video_login_button(message.chat.id, platform)]]))
 
 
 async def send_saved_videos(message, index: int, entry: dict):
@@ -542,12 +565,12 @@ async def run_video_download(message, url: str, history_index: int, download_dir
     db.update_history_entry(history_index, status="interrupted" if error else "done",
                             gallery_name=title, image_count=len(items),
                             resume_url=url if error else "", auto_resume_at="", auto_resume_chat_id="")
+    entry = db.load_history()[history_index]
     if error:
         await message.answer(f"⚠️ {html.escape(str(error))}")
-        if isinstance(error, VideoAuthError) or getattr(error, "needs_login", False):
-            await message.answer(f"Для підключення {PLATFORMS[platform]}: /{platform}_login\n"
-                                 "Після підключення натисни «Докачати» в історії.")
-    entry = db.load_history()[history_index]
+        if isinstance(error, VideoAuthError) or getattr(error, "suggest_login", False):
+            await suggest_video_login(message, platform, required=(
+                isinstance(error, VideoAuthError) or getattr(error, "needs_login", False)))
     if items and not isinstance(error, VideoAuthError):
         await send_saved_videos(message, history_index, entry)
     await message.answer(

@@ -83,6 +83,31 @@ class CookieTests(unittest.TestCase):
         self.assertEqual({c.name for c in jar}, {"c_user", "xs"})
 
 
+class ErrorClassificationTests(unittest.TestCase):
+    def test_ambiguous_site_failures_offer_login_without_claiming_it_is_required(self):
+        for text in ("ERROR: [facebook] 123: Cannot parse data; please report this issue",
+                     "HTTP Error 403: Forbidden", "This video is unavailable", "Unable to extract video data"):
+            with self.subTest(error=text):
+                error = video.classify_download_error(text)
+                self.assertTrue(error.suggest_login)
+                self.assertFalse(error.needs_login)
+                self.assertFalse(error.not_video)
+
+    def test_explicit_login_messages_and_unrelated_failures_are_distinguished(self):
+        for text in ("You must be logged in", "Only available for registered users", "Login required",
+                     "HTTP Error 401: Unauthorized", "Session has expired"):
+            with self.subTest(error=text):
+                error = video.classify_download_error(text)
+                self.assertTrue(error.needs_login)
+                self.assertTrue(error.suggest_login)
+        for text in ("No module named yt_dlp", "No space left on device", "Read-only file system",
+                     "Connection timed out", "Failed to resolve host", "File is larger than max-filesize",
+                     "Unsupported URL: https://example.test", "There is no video in this post"):
+            with self.subTest(error=text):
+                self.assertFalse(video.classify_download_error(text).suggest_login)
+        self.assertTrue(video.classify_download_error("There is no video in this post").not_video)
+
+
 class RoutingStorageTests(unittest.TestCase):
     def test_platforms_short_links_and_spoofed_domains(self):
         for url, expected in zip(URLS, ("facebook", "instagram", "tiktok")):
@@ -161,6 +186,14 @@ class DownloaderTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(raised.exception.needs_login)
         self.assertNotIn("synthetic-secret", str(raised.exception))
         self.assertEqual(len(video.saved_videos(self.folder)), 1)
+
+    async def test_facebook_parse_failure_offers_cookies_without_exposing_extractor_output(self):
+        source = "import sys; print('ERROR: [facebook] 123: Cannot parse data; https://private.test/signed-secret', file=sys.stderr); sys.exit(1)"
+        with self.assertRaises(video.VideoDownloadError) as raised:
+            await self.run_script(source)
+        self.assertTrue(raised.exception.suggest_login)
+        self.assertFalse(raised.exception.needs_login)
+        self.assertNotIn("signed-secret", str(raised.exception))
 
     async def test_timeout_stops_process_and_preserves_partial_file(self):
         partial = self.folder / "clip.mp4.part"
@@ -371,6 +404,40 @@ class VideoBotTests(unittest.IsolatedAsyncioTestCase):
         self.message.answer_video.assert_not_awaited()
         self.assertTrue((folder / "unfinished.mp4").exists())
         self.assertTrue(any("/facebook_login" in call.args[0] for call in self.message.answer.await_args_list))
+
+    async def test_ambiguous_failure_provides_working_login_button_and_keeps_resume(self):
+        index, _ = await self.download(failure=video.classify_download_error("Cannot parse data"))
+        prompts = [call for call in self.message.answer.await_args_list if "/facebook_login" in call.args[0]]
+        self.assertEqual(len(prompts), 1)
+        self.assertIn("може допомогти", prompts[0].args[0])
+        button = prompts[0].kwargs["reply_markup"].inline_keyboard[0][0]
+        self.assertEqual((button.callback_data, button.text), ("video_login:facebook", "🔐 Підключити Facebook"))
+        await self.module.video_login_callback(SimpleNamespace(
+            data=button.callback_data, message=self.message, answer=AsyncMock()))
+        self.assertEqual(self.module.video_auth.pending[123], "facebook")
+        self.assertIn("Netscape", self.message.answer.await_args.args[0])
+        entry = db.load_history()[index]
+        self.assertEqual((entry["status"], entry["resume_url"]), ("interrupted", URLS[0]))
+        keyboard = self.module.build_video_history_keyboard(index, entry)
+        self.assertIn("video_login:facebook", [b.callback_data for row in keyboard.inline_keyboard for b in row])
+
+    async def test_existing_session_offers_cookie_refresh_after_ambiguous_failure(self):
+        self.module.video_auth.save(123, "facebook", cookies())
+        await self.download(failure=video.classify_download_error("Cannot parse data"))
+        prompt = next(call for call in self.message.answer.await_args_list if "/facebook_login" in call.args[0])
+        self.assertEqual(prompt.kwargs["reply_markup"].inline_keyboard[0][0].text, "🔐 Оновити cookies Facebook")
+
+    async def test_network_failure_does_not_request_cookie_import(self):
+        await self.download(failure=video.classify_download_error("Connection timed out"))
+        self.assertFalse(any("/facebook_login" in call.args[0] for call in self.message.answer.await_args_list))
+        self.assertEqual(self.module.video_auth.pending, {})
+
+    async def test_group_auth_suggestion_directs_user_to_private_chat(self):
+        self.message.chat = SimpleNamespace(id=-100, type="group")
+        await self.module.suggest_video_login(self.message, "facebook", required=False)
+        self.assertIn("особистому чаті", self.message.answer.await_args.args[0])
+        self.assertNotIn("reply_markup", self.message.answer.await_args.kwargs)
+        self.assertEqual(self.module.video_auth.pending, {})
 
     async def test_instagram_photo_posts_still_use_gallery_downloader(self):
         with patch.object(self.module, "run_gallery_download", AsyncMock()) as gallery:
