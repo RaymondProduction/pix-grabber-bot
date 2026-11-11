@@ -32,6 +32,11 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 import db
 from pixiv_auth import PixivAuth, PixivAuthError, is_oauth_response, is_pixiv_url
 from media_support import ANIMATION_EXTENSIONS, PIXIV_POSTPROCESSORS, DownloadActivity, probe_animation
+from video_auth import VideoAuth, VideoAuthError, PLATFORMS, COOKIE_LIMIT
+from video_support import (
+    VideoDownloadError, video_platform, video_root, ensure_video_storage,
+    saved_videos, download_video,
+)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -41,9 +46,12 @@ with open('config.json', 'r', encoding='utf-8') as f:
 bot = Bot(token=CONFIG["telegram_token"], default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 pixiv_auth = PixivAuth()
+video_auth = VideoAuth()
 
 BASE_DOWNLOAD_DIR = Path("images")
 BASE_DOWNLOAD_DIR.mkdir(exist_ok=True)
+VIDEO_DOWNLOAD_DIR = video_root(BASE_DOWNLOAD_DIR, CONFIG.get("video_download_dir", ""))
+MAX_VIDEO_UPLOAD_SIZE = int(CONFIG.get("max_video_upload_size_mb", 49)) * 1024 * 1024
 
 ARCHIVE_DIR = Path("arhive")
 ARCHIVE_DIR.mkdir(exist_ok=True)
@@ -52,7 +60,6 @@ HISTORY_PAGE_SIZE = db.HISTORY_PAGE_SIZE
 
 PENDING_PARTIAL_REQUESTS = {}
 PENDING_SEARCH_REQUESTS = set()
-PENDING_DOWNLOAD_REQUESTS = {}
 PENDING_DELETE_REQUESTS = {}  # user_id -> history_index
 PENDING_HISTORY_PAGE_REQUESTS = {}  # user_id -> "plain" | "preview"
 LAST_HISTORY_PAGE = {}  # user_id -> {"plain": page, "preview": page}
@@ -108,6 +115,7 @@ async def start_pixiv_login(message: types.Message, gallery_url: Optional[str] =
     if message.chat.type != "private":
         await message.answer("Підключення Pixiv доступне в особистому чаті з ботом. Надішли там /pixiv_login.")
         return
+    video_auth.pending.pop(message.chat.id, None)
     try:
         session = pixiv_auth.begin(message.chat.id, gallery_url)
     except PixivAuthError as e:
@@ -156,7 +164,7 @@ def get_site_config(url: str):
 
 def normalize_gallery_url(url: str) -> str:
     parsed = urlparse(url.strip())
-    return parsed._replace(query="", fragment="").geturl().rstrip("/")
+    return parsed._replace(fragment="").geturl().rstrip("/")
 
 
 def resolve_zip_part_path(path: Path) -> Path:
@@ -341,6 +349,9 @@ def cleanup_download_folder(folder: Path):
     try:
         folder = folder.resolve()
         base_dir = BASE_DOWNLOAD_DIR.resolve()
+        video_dir = VIDEO_DOWNLOAD_DIR.resolve()
+        if folder == video_dir or video_dir in folder.parents or folder in video_dir.parents:
+            return
         if folder == base_dir or base_dir not in folder.parents:
             return
         if folder.exists():
@@ -352,6 +363,7 @@ def cleanup_download_folder(folder: Path):
 
 def build_main_menu() -> InlineKeyboardMarkup:
     buttons = [
+        [InlineKeyboardButton(text="📥 Грабувати всі відкладені", callback_data="grab_pending")],
         [InlineKeyboardButton(text="📋 Переглянути історію", callback_data="show_history")],
         [InlineKeyboardButton(text="🖼 Переглянути історію з превʼю", callback_data="show_history_preview")],
         [InlineKeyboardButton(text="🔎 Пошук в історії", callback_data="search_history")],
@@ -365,6 +377,7 @@ def build_main_menu() -> InlineKeyboardMarkup:
 def build_service_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔐 Підключити Pixiv", callback_data="pixiv_login")],
+        [InlineKeyboardButton(text="🎬 Facebook / Instagram / TikTok", callback_data="video_accounts")],
         [InlineKeyboardButton(text="⬇️ Скачати JSON з історією", callback_data="export_history_json")],
         [InlineKeyboardButton(text="🧹 Очистити дублікати", callback_data="dedup_history")],
         [InlineKeyboardButton(text="💾 Вільне місце на диску", callback_data="disk_usage")],
@@ -372,9 +385,9 @@ def build_service_menu() -> InlineKeyboardMarkup:
     ])
 
 
-def build_redownload_keyboard(url: str) -> InlineKeyboardMarkup:
+def build_redownload_keyboard(url: str, chat_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔄 Скачати наново", callback_data=f"mode:new:{register_download_request(url)}")],
+        [InlineKeyboardButton(text="🔄 Скачати наново", callback_data=f"mode:new:{db.register_download_request(chat_id, url, pending=False)}")],
         [InlineKeyboardButton(text="⬅️ До історії", callback_data="show_history")]
     ])
 
@@ -397,21 +410,167 @@ def build_history_actions_keyboard(index: int, url: str) -> InlineKeyboardMarkup
     ])
 
 
-def search_history_entries(query: str) -> list[tuple[int, dict]]:
+def can_access_entry(entry: dict, chat_id: int) -> bool:
+    return entry.get("media_kind") != "video" or entry.get("owner_chat_id") == str(chat_id)
+
+
+def visible_history(chat_id: int) -> list[dict]:
+    return [dict(entry, _history_index=index) for index, entry in enumerate(db.load_history())
+            if can_access_entry(entry, chat_id)]
+
+
+@dp.callback_query.outer_middleware()
+async def protect_video_history(handler, event, data):
+    prefixes = {"history_item", "resend", "all_photos", "partial", "resume", "get_url",
+                "delete_history_item", "archive_item"}
+    prefix, _, value = (event.data or "").partition(":")
+    if prefix in prefixes:
+        history = db.load_history()
+        if (not value.isdigit() or int(value) >= len(history) or not event.message
+                or not can_access_entry(history[int(value)], event.message.chat.id)):
+            await event.answer("Запис не знайдено в цьому чаті.", show_alert=True)
+            return
+    return await handler(event, data)
+
+
+def build_video_history_keyboard(index: int, entry: dict) -> InlineKeyboardMarkup:
+    buttons = [[InlineKeyboardButton(text="🎬 Надіслати відео", callback_data=f"resend:{index}")]]
+    if entry.get("status") == "interrupted":
+        buttons.append([InlineKeyboardButton(text="⏩ Докачати", callback_data=f"resume:{index}")])
+    buttons.extend([
+        [InlineKeyboardButton(text="🔗 Отримати посилання", callback_data=f"get_url:{index}")],
+        [InlineKeyboardButton(text="🗑 Видалити з історії", callback_data=f"delete_history_item:{index}")],
+        [InlineKeyboardButton(text="⬅️ До історії", callback_data="show_history")],
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+async def send_saved_videos(message, index: int, entry: dict):
+    if not can_access_entry(entry, message.chat.id):
+        await message.answer("Запис не знайдено в цьому чаті.")
+        return
+    folder = Path(entry["download_dir"])
+    items = saved_videos(folder)
+    messages = {ref["file_name"]: ref for ref in get_image_messages(entry)}
+    # Telegram can still hold the video when the SSD is temporarily offline.
+    if not items:
+        items = [{"file": name, "title": entry["gallery_name"]} for name in messages]
+    sent_count = 0
+    for item in items:
+        ref = messages.get(item["file"])
+        if ref:
+            try:
+                await bot.forward_message(chat_id=message.chat.id, from_chat_id=int(ref["chat_id"]),
+                                          message_id=int(ref["message_id"]))
+                sent_count += 1
+                continue
+            except TelegramAPIError:
+                pass
+        path = folder / item["file"]
+        if not path.is_file() or path.is_symlink():
+            await message.answer(f"⚠️ Файл недоступний на диску: <code>{html.escape(path.name)}</code>.")
+            continue
+        if path.stat().st_size > MAX_VIDEO_UPLOAD_SIZE:
+            await message.answer(
+                f"💾 Відео збережено: <code>{html.escape(str(path))}</code>\n"
+                f"Розмір {path.stat().st_size / 1024 ** 2:.1f} МіБ перевищує ліміт надсилання бота "
+                f"({MAX_VIDEO_UPLOAD_SIZE / 1024 ** 2:g} МіБ). Оригінал залишається на диску.")
+            continue
+        caption = html.escape(str(item.get("title") or path.stem)[:300])
+        try:
+            if path.suffix.lower() == ".mp4":
+                try:
+                    sent = await message.answer_video(types.FSInputFile(path), caption=caption,
+                                                       supports_streaming=True, request_timeout=180)
+                except TelegramAPIError:
+                    sent = await message.answer_document(types.FSInputFile(path), caption=caption,
+                                                          request_timeout=180)
+            else:
+                sent = await message.answer_document(types.FSInputFile(path), caption=caption,
+                                                      request_timeout=180)
+            if db.find_history_index_by_id(entry["_id"]) is None:
+                return sent_count
+            db.append_image_message(entry["_id"], path.name, str(sent.chat.id), sent.message_id, kind="video")
+            if not entry.get("preview_message"):
+                db.set_preview_message(entry["_id"], str(sent.chat.id), sent.message_id)
+            sent_count += 1
+        except TelegramAPIError:
+            await message.answer("⚠️ Telegram не прийняв відео. Оригінал збережено; повтори надсилання з історії.")
+    if not items:
+        await message.answer("Збережених відео поки немає. Можна повторити завантаження.",
+                             reply_markup=build_redownload_keyboard(entry["url"], message.chat.id))
+    return sent_count
+
+
+async def run_video_download(message, url: str, history_index: int, download_dir: Path):
+    platform = video_platform(url)
+    download_id = db.find_download_id_by_index(history_index)
+    db.update_history_entry(history_index, media_kind="video", owner_chat_id=str(message.chat.id),
+                            resume_url=url, download_dir=str(download_dir),
+                            gallery_name=f"{PLATFORMS[platform]} — відео")
+    error = None
+    try:
+        ensure_video_storage(BASE_DOWNLOAD_DIR, VIDEO_DOWNLOAD_DIR)
+        if not shutil.which("ffmpeg"):
+            raise VideoDownloadError("На сервері потрібен FFmpeg: sudo apt install ffmpeg.")
+        cookies = video_auth.read(message.chat.id, platform)
+        await download_video(
+            url, download_dir, cookies,
+            timeout=int(CONFIG.get("video_timeout_sec", 1800)),
+            stall_timeout=int(CONFIG.get("video_stall_timeout_sec", 300)),
+            max_bytes=int(CONFIG.get("max_video_download_size_mb", 2048)) * 1024 ** 2,
+        )
+        if video_auth.read(message.chat.id, platform) != cookies:
+            raise VideoAuthError("Сесію змінено під час завантаження. Повтори дію з історії.")
+    except (VideoDownloadError, VideoAuthError) as exc:
+        error = exc
+    except asyncio.CancelledError:
+        db.mark_download_interrupted(download_id)
+        raise
+    history_index = db.find_history_index_by_id(download_id)
+    if history_index is None:
+        return
+    if getattr(error, "not_video", False) and not saved_videos(download_dir):
+        # Instagram /p/ URLs can also be ordinary photo posts.
+        photo_dir = BASE_DOWNLOAD_DIR / download_dir.name
+        db.update_history_entry(history_index, media_kind="gallery", owner_chat_id="",
+                                download_dir=str(photo_dir), resume_url="")
+        await message.answer("У цьому дописі немає відео. Завантажую його як галерею зображень.")
+        return await run_gallery_download(message, url, history_index, photo_dir)
+    items = saved_videos(download_dir)
+    title = items[0]["title"] if items else f"{PLATFORMS[platform]} — відео"
+    db.update_history_entry(history_index, status="interrupted" if error else "done",
+                            gallery_name=title, image_count=len(items),
+                            resume_url=url if error else "", auto_resume_at="", auto_resume_chat_id="")
+    if error:
+        await message.answer(f"⚠️ {html.escape(str(error))}")
+        if isinstance(error, VideoAuthError) or getattr(error, "needs_login", False):
+            await message.answer(f"Для підключення {PLATFORMS[platform]}: /{platform}_login\n"
+                                 "Після підключення натисни «Докачати» в історії.")
+    entry = db.load_history()[history_index]
+    if items and not isinstance(error, VideoAuthError):
+        await send_saved_videos(message, history_index, entry)
+    await message.answer(
+        f"{'⏸' if error else '✅'} Відео збережено: {len(items)}.\n"
+        f"📁 <code>{html.escape(str(download_dir))}</code>",
+        reply_markup=build_video_history_keyboard(history_index, entry))
+
+
+def search_history_entries(query: str, chat_id: Optional[int] = None) -> list[tuple[int, dict]]:
     normalized = query.strip().lower()
     if not normalized:
         return []
     history = db.load_history()
     results = [
         (i, entry) for i, entry in enumerate(history)
-        if normalized in entry.get("gallery_name", "").lower()
-        or normalized in entry.get("url", "").lower()
+        if can_access_entry(entry, chat_id) and (normalized in entry.get("gallery_name", "").lower()
+        or normalized in entry.get("url", "").lower())
     ]
     return list(reversed(results))
 
 
 async def send_search_results(message: types.Message, query: str):
-    results = search_history_entries(query)
+    results = search_history_entries(query, message.chat.id)
     if not results:
         await message.answer(
             f"🔎 За запитом <b>{query}</b> нічого не знайдено.",
@@ -1107,7 +1266,17 @@ def archive_all_entries() -> tuple[int, int]:
     return processed, total_moved
 
 
-def find_done_history_entry_by_url(url: str) -> Optional[int]:
+def find_done_history_entry_by_url(url: str, chat_id: Optional[int] = None) -> Optional[int]:
+    if video_platform(url):
+        for index, entry in reversed(list(enumerate(db.load_history()))):
+            if (entry.get("media_kind") == "video" and entry.get("status") == "done"
+                    and can_access_entry(entry, chat_id)
+                    and normalize_gallery_url(entry["url"]) == normalize_gallery_url(url)
+                    and (entry.get("image_messages") or any(
+                        (Path(entry["download_dir"]) / item["file"]).is_file()
+                        for item in saved_videos(Path(entry["download_dir"]))))):
+                return index
+        return db.find_done_entry_by_url(normalize_gallery_url(url))
     return db.find_done_entry_by_url(normalize_gallery_url(url))
 
 
@@ -1147,6 +1316,8 @@ def get_history_item_marker(entry: dict) -> str:
         return "⏸"
     if status == "failed":
         return "🚫"
+    if entry.get("media_kind") == "video":
+        return "🟡" if status == "in_progress" else "🎬"
     if Path(entry.get("zip_path", "")).exists() \
        or entry.get("archive_message_id") \
        or entry.get("archive_messages"):
@@ -1177,7 +1348,7 @@ def format_selected_pages(pages: list[int]) -> str:
 
 
 async def send_history(message: types.Message, page: int = 0):
-    history = db.load_history()
+    history = visible_history(message.chat.id)
     if not history:
         await message.answer("Історія порожня.", reply_markup=build_main_menu())
         return
@@ -1188,7 +1359,7 @@ async def send_history(message: types.Message, page: int = 0):
 
     buttons = []
     for i, entry in page_items:
-        real_index = len(history) - 1 - i
+        real_index = entry.get("_history_index", len(history) - 1 - i)
         buttons.append([build_history_item_button(real_index, entry)])
 
     nav = []
@@ -1224,7 +1395,7 @@ async def send_history_preview_images(message: types.Message, page_items: list[t
     previews_to_forward = []
 
     for i, entry in page_items:
-        real_index = history_len - 1 - i
+        real_index = entry.get("_history_index", history_len - 1 - i)
         existing_zip_parts = [p for p in get_zip_parts(entry) if p.exists()]
         preview_added = False
 
@@ -1282,7 +1453,7 @@ async def send_history_preview_images(message: types.Message, page_items: list[t
 
 
 async def send_history_with_preview(message: types.Message, page: int = 0):
-    history = db.load_history()
+    history = visible_history(message.chat.id)
     if not history:
         await message.answer("Історія порожня.", reply_markup=build_main_menu())
         return
@@ -1295,7 +1466,7 @@ async def send_history_with_preview(message: types.Message, page: int = 0):
 
     buttons = []
     for i, entry in page_items:
-        real_index = len(history) - 1 - i
+        real_index = entry.get("_history_index", len(history) - 1 - i)
         buttons.append([build_history_item_button(real_index, entry)])
 
     nav = []
@@ -1327,7 +1498,7 @@ async def send_history_with_preview(message: types.Message, page: int = 0):
 
 
 async def send_history_selected_pages(message: types.Message, pages: list[int], preview: bool):
-    history = db.load_history()
+    history = visible_history(message.chat.id)
     if not history:
         await message.answer("Історія порожня.", reply_markup=build_main_menu())
         return
@@ -1345,7 +1516,7 @@ async def send_history_selected_pages(message: types.Message, pages: list[int], 
 
     buttons = []
     for i, entry in combined_items:
-        real_index = len(history) - 1 - i
+        real_index = entry.get("_history_index", len(history) - 1 - i)
         buttons.append([build_history_item_button(real_index, entry)])
 
     buttons.append([InlineKeyboardButton(
@@ -1362,12 +1533,14 @@ async def send_history_selected_pages(message: types.Message, pages: list[int], 
     )
 
 
-def get_background_resume_items() -> tuple[list[tuple[int, dict]], list[tuple[int, dict]], list[tuple[int, dict]]]:
+def get_background_resume_items(chat_id: Optional[int] = None) -> tuple[list[tuple[int, dict]], list[tuple[int, dict]], list[tuple[int, dict]]]:
     scheduled = []
     unscheduled = []
     without_resume_url = []
 
     for index, entry in enumerate(db.load_history()):
+        if chat_id is not None and not can_access_entry(entry, chat_id):
+            continue
         if entry.get("status") != "interrupted":
             continue
         if not entry.get("resume_url"):
@@ -1406,13 +1579,13 @@ async def send_background_resume_item(message: types.Message, index: int, entry:
 
     keyboard = (
         build_resume_keyboard(index) if entry.get("resume_url")
-        else build_redownload_keyboard(entry.get("url", ""))
+        else build_redownload_keyboard(entry.get("url", ""), message.chat.id)
     )
     await message.answer("\n".join(lines), reply_markup=keyboard)
 
 
 async def send_background_resumes(message: types.Message):
-    scheduled, unscheduled, without_resume_url = get_background_resume_items()
+    scheduled, unscheduled, without_resume_url = get_background_resume_items(message.chat.id)
 
     if not scheduled and not unscheduled and not without_resume_url:
         await message.answer("⏳ Фонових докачок немає.", reply_markup=build_main_menu())
@@ -1446,6 +1619,8 @@ async def send_background_resumes(message: types.Message):
 
 
 def schedule_entry_for_background_resume(index: int, entry: dict, chat_id: int) -> bool:
+    if not can_access_entry(entry, chat_id):
+        return False
     if entry.get("status") != "interrupted" or not entry.get("resume_url"):
         return False
 
@@ -1462,6 +1637,12 @@ def schedule_entry_for_background_resume(index: int, entry: dict, chat_id: int) 
 
 
 async def run_download(message: types.Message, url: str, history_index: int, download_dir: Path):
+    if video_platform(url):
+        return await run_video_download(message, url, history_index, download_dir)
+    return await run_gallery_download(message, url, history_index, download_dir)
+
+
+async def run_gallery_download(message: types.Message, url: str, history_index: int, download_dir: Path):
     cfg = get_site_config(url)
     username = cfg.get("username")
     password = cfg.get("password")
@@ -1748,6 +1929,9 @@ class ChatMessageProxy:
     async def answer_animation(self, animation, **kwargs):
         return await bot.send_animation(self.chat.id, animation=animation, **kwargs)
 
+    async def answer_video(self, video, **kwargs):
+        return await bot.send_video(self.chat.id, video=video, **kwargs)
+
     async def answer_document(self, document, **kwargs):
         return await bot.send_document(self.chat.id, document=document, **kwargs)
 
@@ -1798,7 +1982,7 @@ async def auto_resume_worker():
             await message.answer("⏩ Починаю автоматичну докачку...")
 
             db.update_history_entry(index, status="in_progress", auto_resume_at="", download_dir=download_dir_value)
-            await get_download_queue().put((message, entry["resume_url"], index, Path(download_dir_value)))
+            await get_download_queue().put((message, entry["resume_url"], entry["_id"], Path(download_dir_value)))
 
             if not queue_worker_started:
                 queue_worker_started = True
@@ -1809,10 +1993,12 @@ async def queue_worker():
     global active_downloads
     queue = get_download_queue()
     while True:
-        message, url, history_index, download_dir = await queue.get()
-        download_id = db.find_download_id_by_index(history_index)
+        message, url, download_id, download_dir = await queue.get()
         active_downloads += 1
         try:
+            history_index = db.find_history_index_by_id(download_id)
+            if history_index is None:
+                continue  # Запис могли видалити, доки він чекав у черзі.
             await run_download(message, url, history_index, download_dir)
         except Exception as e:
             logging.exception(f"Помилка в черзі для {url}: {e}")
@@ -1829,21 +2015,13 @@ async def queue_worker():
             queue.task_done()
 
 
-def register_download_request(url: str) -> str:
-    token = str(len(PENDING_DOWNLOAD_REQUESTS) + 1)
-    PENDING_DOWNLOAD_REQUESTS[token] = url
-    return token
-
-
-def get_download_request(token: str) -> Optional[str]:
-    return PENDING_DOWNLOAD_REQUESTS.get(token)
-
-
-def _find_active_history_entry_by_url(url: str) -> Optional[int]:
+def _find_active_history_entry_by_url(url: str, chat_id: Optional[int] = None) -> Optional[int]:
     """Повертає індекс interrupted/in_progress запису для URL, якщо є."""
     normalized = normalize_gallery_url(url)
     history = db.load_history()
     for i, entry in enumerate(history):
+        if not can_access_entry(entry, chat_id):
+            continue
         if normalize_gallery_url(entry.get("url", "")) != normalized:
             continue
         if entry.get("status") in ("interrupted", "in_progress"):
@@ -1852,15 +2030,22 @@ def _find_active_history_entry_by_url(url: str) -> Optional[int]:
 
 
 async def handle_url(message: types.Message, url: str):
+    token = db.register_download_request(message.chat.id, url)
     if is_pixiv_url(url) and not pixiv_auth.has_token(message.chat.id):
-        if message.chat.type == "private":
+        if message.chat.id in pixiv_auth.sessions or message.chat.id in pixiv_auth.exchanging:
+            await message.answer(
+                "📥 Посилання збережено. Заверши вхід у Pixiv, потім надішли /grab_pending, "
+                "щоб завантажити всі відкладені посилання."
+            )
+        elif message.chat.type == "private":
             await start_pixiv_login(message, gallery_url=url)
         else:
             await request_pixiv_login(message, url)
         return
     # Спочатку перевіряємо чи є незавершене завантаження
-    active_index = _find_active_history_entry_by_url(url)
+    active_index = _find_active_history_entry_by_url(url, message.chat.id)
     if active_index is not None:
+        db.discard_download_request(token, message.chat.id)
         history = db.load_history()
         entry = history[active_index]
         status = entry.get("status")
@@ -1876,7 +2061,7 @@ async def handle_url(message: types.Message, url: str):
         elif status == "interrupted":
             await message.answer(
                 "Попередня спроба перервалася без даних для докачки. Можна почати завантаження наново:",
-                reply_markup=build_redownload_keyboard(url),
+                reply_markup=build_redownload_keyboard(url, message.chat.id),
             )
         else:
             await message.answer(
@@ -1887,10 +2072,14 @@ async def handle_url(message: types.Message, url: str):
             )
         return
 
-    existing_index = find_done_history_entry_by_url(url)
+    existing_index = find_done_history_entry_by_url(url, message.chat.id)
     if existing_index is not None:
+        db.discard_download_request(token, message.chat.id)
         history = db.load_history()
         entry = history[existing_index]
+        if entry.get("media_kind") == "video":
+            await send_saved_videos(message, existing_index, entry)
+            return
         await message.answer(
             f"♻️ Це посилання вже є в історії і архів уже скачано.\n\n"
             f"📁 <b>{entry['gallery_name']}</b>\n"
@@ -1901,12 +2090,101 @@ async def handle_url(message: types.Message, url: str):
         await send_existing_archive_from_history(message, existing_index)
         return
 
-    await message.answer(f"🔄 Посилання прийнято: <b>{urlparse(url).netloc}</b>")
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📸 Грабуємо 👏🏽", callback_data=f"mode:new:{register_download_request(url)}")],
+        [InlineKeyboardButton(text="📸 Грабуємо 👏🏽", callback_data=f"mode:new:{token}")],
+        [InlineKeyboardButton(text="📥 Грабувати всі відкладені", callback_data="grab_pending")],
         [InlineKeyboardButton(text="📋 Історія", callback_data="show_history")]
     ])
-    await message.answer("Натисни щоб почати завантаження:", reply_markup=keyboard)
+    await message.answer(
+        f"📥 Посилання збережено: <b>{html.escape(urlparse(url).netloc)}</b>\n\n"
+        "Натисни «Грабуємо» зараз або пізніше надішли /grab_pending, "
+        "щоб завантажити всі відкладені посилання.",
+        reply_markup=keyboard,
+    )
+
+
+def enqueue_download_request(
+    message: types.Message, token: str, handled_urls: Optional[set[str]] = None,
+) -> tuple[str, int]:
+    """Не чекає Telegram між перевіркою запиту, його споживанням та додаванням у чергу."""
+    global queue_worker_started
+    request = db.get_download_request(token, message.chat.id)
+    if request is None:
+        return "missing", 0
+    url = request["url"]
+    normalized_url = normalize_gallery_url(url)
+    if request["pending"]:
+        if handled_urls is not None:
+            existing = normalized_url in handled_urls
+        else:
+            existing = (
+                _find_active_history_entry_by_url(url, message.chat.id) is not None
+                or find_done_history_entry_by_url(url, message.chat.id) is not None
+            )
+        if existing:
+            db.discard_download_request(token, message.chat.id)
+            return "existing", 0
+    if is_pixiv_url(url) and not pixiv_auth.has_token(message.chat.id):
+        return "auth", 0
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    platform = video_platform(url)
+    root = VIDEO_DOWNLOAD_DIR / platform / str(message.chat.id) if platform else BASE_DOWNLOAD_DIR
+    download_dir = root / f"{timestamp}_{urlparse(url).netloc}_{token}"
+    download_id = db.claim_download_request(token, message.chat.id, str(download_dir),
+                                            media_kind="video" if platform else "gallery")
+    if download_id is None:
+        return "missing", 0
+    queue = get_download_queue()
+    position = queue.qsize() + active_downloads + 1
+    queue.put_nowait((message, url, download_id, download_dir))
+    if handled_urls is not None:
+        handled_urls.add(normalized_url)
+    if not queue_worker_started:
+        queue_worker_started = True
+        asyncio.create_task(queue_worker())
+    return "queued", position
+
+
+async def grab_pending_downloads(message: types.Message):
+    requests = db.list_pending_download_requests(message.chat.id)
+    if not requests:
+        await message.answer("📭 Немає відкладених посилань у цьому чаті.", reply_markup=build_main_menu())
+        return
+
+    queued = skipped = 0
+    needs_login = []
+    # Історію з усіма повідомленнями читаємо один раз на пакет, а не для кожного URL.
+    handled_urls = {
+        normalize_gallery_url(entry["url"]) for entry in visible_history(message.chat.id)
+        if entry["status"] in ("in_progress", "interrupted")
+        or (entry["status"] == "done" and (
+            entry.get("archive_messages") or any(Path(p).exists() for p in entry.get("zip_parts", []))
+            or (entry.get("media_kind") == "video" and (entry.get("image_messages") or any(
+                (Path(entry["download_dir"]) / item["file"]).is_file()
+                for item in saved_videos(Path(entry["download_dir"])))))
+        ))
+    }
+    for request in requests:
+        status, _ = enqueue_download_request(message, request["token"], handled_urls)
+        if status == "queued":
+            queued += 1
+        elif status == "auth":
+            needs_login.append(request["url"])
+        else:
+            skipped += 1
+
+    lines = [f"📥 Додано в чергу: <b>{queued}</b>. Завантажуватиму по черзі."]
+    if skipped:
+        lines.append(f"Вже оброблені посилання пропущено: {skipped}.")
+    if needs_login:
+        lines.append(
+            f"🔐 Ще {len(needs_login)} посилань залишено у відкладених: потрібен вхід у Pixiv. "
+            "Після входу надішли /grab_pending ще раз."
+        )
+    await message.answer("\n".join(lines), reply_markup=build_main_menu())
+    if needs_login:
+        await request_pixiv_login(message, needs_login[0])
 
 
 async def send_existing_archive_from_history(message: types.Message, index: int):
@@ -1916,6 +2194,9 @@ async def send_existing_archive_from_history(message: types.Message, index: int)
         return
 
     entry = history[index]
+    if entry.get("media_kind") == "video":
+        await send_saved_videos(message, index, entry)
+        return
     zip_parts = get_zip_parts(entry)
     existing = [p for p in zip_parts if p.exists()]
 
@@ -1982,7 +2263,7 @@ async def send_existing_archive_from_history(message: types.Message, index: int)
     if not existing:
         await message.answer(
             "⚠️ Архів недоступний або був видалений.\n\nМожна скачати його наново:",
-            reply_markup=build_redownload_keyboard(entry["url"])
+            reply_markup=build_redownload_keyboard(entry["url"], message.chat.id)
         )
         return
 
@@ -2015,24 +2296,27 @@ async def send_existing_archive_from_history(message: types.Message, index: int)
 async def disk_usage_callback(callback: types.CallbackQuery):
     import shutil
 
-    try:
-        # Краще дивитись диск де архіви
-        total, used, free = shutil.disk_usage(ARCHIVE_DIR)
-    except:
-        total, used, free = shutil.disk_usage("/")
-
     def fmt(size):
         for unit in ["B", "KB", "MB", "GB", "TB"]:
             if size < 1024:
                 return f"{size:.2f} {unit}"
             size /= 1024
 
-    text = (
-        "💾 <b>Стан диску</b>\n\n"
-        f"📦 Загалом: {fmt(total)}\n"
-        f"📉 Використано: {fmt(used)}\n"
-        f"📗 Вільно: {fmt(free)}"
-    )
+    sections = ["💾 <b>Стан дисків</b>"]
+    for label, path in (("Зображення", BASE_DOWNLOAD_DIR), ("Відео", VIDEO_DOWNLOAD_DIR),
+                        ("Архіви", ARCHIVE_DIR)):
+        resolved = path.resolve()
+        probe = path
+        # The videos subdirectory may not exist before the first download.
+        while not probe.exists() and not probe.is_symlink() and probe != probe.parent:
+            probe = probe.parent
+        try:
+            total, used, free = shutil.disk_usage(probe)
+            sections.append(f"<b>{label}</b>: <code>{html.escape(str(resolved))}</code>\n"
+                            f"Загалом: {fmt(total)} • Вільно: {fmt(free)}")
+        except OSError:
+            sections.append(f"<b>{label}</b>: сховище недоступне.")
+    text = "\n\n".join(sections)
 
     await callback.answer()
     await callback.message.answer(text, reply_markup=build_service_menu())
@@ -2080,7 +2364,7 @@ async def history_preview_page_callback(callback: types.CallbackQuery):
 @dp.callback_query(F.data.startswith("select_history_pages:"))
 async def select_history_pages_callback(callback: types.CallbackQuery):
     mode = callback.data.split(":", 1)[1]
-    history = db.load_history()
+    history = visible_history(callback.message.chat.id)
     page_count = db.get_history_page_count(len(history))
     await callback.answer()
     PENDING_HISTORY_PAGE_REQUESTS[callback.from_user.id] = mode
@@ -2096,7 +2380,7 @@ async def select_history_pages_callback(callback: types.CallbackQuery):
 @dp.callback_query(F.data == "export_history_json")
 async def export_history_json_callback(callback: types.CallbackQuery):
     await callback.answer()
-    history = db.load_history()
+    history = visible_history(callback.message.chat.id)
     if not history:
         await callback.message.answer("Історія порожня.", reply_markup=build_service_menu())
         return
@@ -2123,7 +2407,7 @@ async def background_resumes_callback(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data == "schedule_background_resumes")
 async def schedule_background_resumes_callback(callback: types.CallbackQuery):
-    scheduled, unscheduled, _ = get_background_resume_items()
+    scheduled, unscheduled, _ = get_background_resume_items(callback.message.chat.id)
     planned = 0
 
     for index, entry in unscheduled:
@@ -2142,6 +2426,7 @@ async def start_next_background_resume_callback(callback: types.CallbackQuery):
     candidates = [
         (index, entry) for index, entry in enumerate(history)
         if entry.get("status") == "interrupted" and entry.get("resume_url")
+        and can_access_entry(entry, callback.message.chat.id)
     ]
 
     if not candidates:
@@ -2170,7 +2455,7 @@ async def start_next_background_resume_callback(callback: types.CallbackQuery):
         auto_resume_chat_id=str(callback.message.chat.id),
         download_dir=download_dir_value
     )
-    await queue.put((callback.message, resume_url, index, Path(download_dir_value)))
+    await queue.put((callback.message, resume_url, entry["_id"], Path(download_dir_value)))
 
     if not queue_worker_started:
         queue_worker_started = True
@@ -2228,6 +2513,20 @@ async def history_item_callback(callback: types.CallbackQuery):
         return
 
     entry = history[index]
+    if entry.get("media_kind") == "video":
+        if not can_access_entry(entry, callback.message.chat.id):
+            await callback.answer("Запис не знайдено.", show_alert=True)
+            return
+        await callback.answer()
+        status_label = {"done": "завершено", "interrupted": "перервано",
+                        "in_progress": "завантажується", "failed": "помилка"}.get(entry["status"], entry["status"])
+        await callback.message.answer(
+            f"🎬 <b>{html.escape(entry['gallery_name'])}</b>\n"
+            f"Відео: {entry['image_count']} • {status_label}\n"
+            f"📁 <code>{html.escape(entry['download_dir'])}</code>\n"
+            f"🔗 {html.escape(entry['url'])}",
+            reply_markup=build_video_history_keyboard(index, entry))
+        return
     zip_parts = get_zip_parts(entry)
     status = entry.get("status", "done")
 
@@ -2286,7 +2585,7 @@ async def history_item_callback(callback: types.CallbackQuery):
         await callback.message.answer(
             f"⚠️ Архів для <b>{entry['gallery_name']}</b> недоступний або видалений.\n\n"
             f"Можна спробувати скачати наново:\n{entry['url']}",
-            reply_markup=build_redownload_keyboard(entry["url"])
+            reply_markup=build_redownload_keyboard(entry["url"], callback.message.chat.id)
         )
         return
 
@@ -2399,7 +2698,7 @@ async def all_photos_callback(callback: types.CallbackQuery):
         await callback.answer()
         await callback.message.answer(
             "⚠️ Фото недоступні. Можна скачати наново:",
-            reply_markup=build_redownload_keyboard(entry["url"])
+            reply_markup=build_redownload_keyboard(entry["url"], callback.message.chat.id)
         )
         return
 
@@ -2459,7 +2758,7 @@ async def partial_resend_request(callback: types.CallbackQuery):
         await callback.answer()
         await callback.message.answer(
             "⚠️ Архів недоступний або був видалений.\nМожна скачати його наново:",
-            reply_markup=build_redownload_keyboard(entry["url"])
+            reply_markup=build_redownload_keyboard(entry["url"], callback.message.chat.id)
         )
         return
 
@@ -2524,7 +2823,7 @@ async def resume_download(callback: types.CallbackQuery):
         await callback.message.answer(f"⏩ Докачку додано в чергу. Позиція: {position + 1}")
 
     db.update_history_entry(index, status="in_progress", auto_resume_at="", auto_resume_chat_id="")
-    await queue.put((callback.message, resume_url, index, Path(download_dir_value)))
+    await queue.put((callback.message, resume_url, entry["_id"], Path(download_dir_value)))
 
     if not queue_worker_started:
         queue_worker_started = True
@@ -2533,29 +2832,37 @@ async def resume_download(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data.startswith("mode:"))
 async def process_mode(callback: types.CallbackQuery):
-    global queue_worker_started
     _, action, token = callback.data.split(":", 2)
-    url = get_download_request(token)
-    if not url:
-        await callback.answer("Посилання для цієї кнопки вже недоступне. Надішли URL ще раз.", show_alert=True)
+    status, position = enqueue_download_request(callback.message, token)
+    if status == "missing":
+        await callback.answer("Це посилання вже додано в чергу або кнопка застаріла.", show_alert=True)
+        return
+    if status == "existing":
+        await callback.answer("Це посилання вже є в історії. Перевір /history.", show_alert=True)
+        return
+    await callback.answer()
+    if status == "auth":
+        request = db.get_download_request(token, callback.message.chat.id)
+        if request:
+            await request_pixiv_login(callback.message, request["url"])
         return
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    download_dir = BASE_DOWNLOAD_DIR / f"{timestamp}_{urlparse(url).netloc}"
-    history_index = db.add_history_entry(url, str(download_dir))
+    text = "✅ Починаю скачування..." if position == 1 else f"✅ Додано в чергу. Позиція: {position}"
+    try:
+        await callback.message.edit_text(text)
+    except TelegramAPIError:
+        await callback.message.answer(text)
 
-    queue = get_download_queue()
-    position = queue.qsize() + active_downloads
-    if position == 0:
-        await callback.message.edit_text("✅ Починаю скачування...")
-    else:
-        await callback.message.edit_text(f"✅ Додано в чергу. Позиція: {position + 1}")
 
-    await queue.put((callback.message, url, history_index, download_dir))
+@dp.callback_query(F.data == "grab_pending")
+async def grab_pending_callback(callback: types.CallbackQuery):
+    await callback.answer()
+    await grab_pending_downloads(callback.message)
 
-    if not queue_worker_started:
-        queue_worker_started = True
-        asyncio.create_task(queue_worker())
+
+@dp.message(Command("grab_pending"))
+async def cmd_grab_pending(message: types.Message):
+    await grab_pending_downloads(message)
 
 
 @dp.callback_query(F.data.startswith("resend:"))
@@ -2570,6 +2877,95 @@ async def cmd_search(message: types.Message):
     PENDING_SEARCH_REQUESTS.add(message.from_user.id)
     PENDING_PARTIAL_REQUESTS.pop(message.from_user.id, None)
     await message.answer("🔎 Введи частину назви або частину посилання.", reply_markup=build_main_menu())
+
+
+async def start_video_login(message, platform: str):
+    if message.chat.type != "private":
+        await message.answer("Підключення акаунта доступне лише в особистому чаті з ботом.")
+        return
+    pixiv_auth.sessions.pop(message.chat.id, None)
+    video_auth.pending[message.chat.id] = platform
+    await message.answer(
+        f"🔐 <b>Підключення {PLATFORMS[platform]}</b>\n\n"
+        f"1. Увійди на <b>{platform}.com</b> у своєму браузері.\n"
+        "2. Експортуй cookies цього сайту у текстовому форматі <b>Netscape</b>.\n"
+        "3. Надішли файл <code>cookies.txt</code> сюди як документ (до 256 КіБ).\n\n"
+        "Cookies дають доступ до твого акаунта — це приватний файл. "
+        "Бот збереже лише cookies обраного сайту для цього особистого чату "
+        "і спробує видалити повідомлення з файлом. Пароль не потрібен.\n"
+        "Скасувати: /cancel.")
+
+
+@dp.message(Command("facebook_login", "instagram_login", "tiktok_login"))
+async def cmd_video_login(message: types.Message):
+    platform = message.text.split()[0].split("@")[0][1:].removesuffix("_login")
+    await start_video_login(message, platform)
+
+
+@dp.callback_query(F.data == "video_accounts")
+async def video_accounts_callback(callback: types.CallbackQuery):
+    await callback.answer()
+    if callback.message.chat.type != "private":
+        await callback.message.answer("Керування акаунтами доступне в особистому чаті.")
+        return
+    buttons = []
+    lines = ["🎬 <b>Акаунти для завантаження відео</b>"]
+    for platform, label in PLATFORMS.items():
+        lines.append(f"{label}: {video_auth.status(callback.message.chat.id, platform)}")
+        buttons.append([
+            InlineKeyboardButton(text=f"🔐 {label}", callback_data=f"video_login:{platform}"),
+            InlineKeyboardButton(text="Відключити", callback_data=f"video_logout:{platform}"),
+        ])
+    await callback.message.answer("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+
+
+@dp.callback_query(F.data.startswith("video_login:"))
+async def video_login_callback(callback: types.CallbackQuery):
+    await callback.answer()
+    platform = callback.data.split(":", 1)[1]
+    if platform in PLATFORMS:
+        await start_video_login(callback.message, platform)
+
+
+@dp.callback_query(F.data.startswith("video_logout:"))
+async def video_logout_callback(callback: types.CallbackQuery):
+    await callback.answer()
+    platform = callback.data.split(":", 1)[1]
+    if callback.message.chat.type == "private" and platform in PLATFORMS:
+        video_auth.disconnect(callback.message.chat.id, platform)
+        video_auth.pending.pop(callback.message.chat.id, None)
+        await callback.message.answer(f"{PLATFORMS[platform]} відключено. Збережені відео залишаються на диску.")
+
+
+@dp.message(Command("cancel"), lambda message: message.chat.id in video_auth.pending)
+async def cancel_video_login(message: types.Message):
+    video_auth.pending.pop(message.chat.id, None)
+    await message.answer("Підключення скасовано.", reply_markup=build_main_menu())
+
+
+@dp.message(F.document, lambda message: message.chat.type == "private"
+            and message.chat.id in video_auth.pending)
+async def receive_video_cookies(message: types.Message):
+    platform = video_auth.pending[message.chat.id]
+    try:
+        if not message.document.file_size or message.document.file_size > COOKIE_LIMIT:
+            raise VideoAuthError("Файл cookies має бути не більшим за 256 КіБ.")
+        buffer = io.BytesIO()
+        await bot.download(message.document, destination=buffer)
+        video_auth.save(message.chat.id, platform, buffer.getvalue())
+    except VideoAuthError as exc:
+        await message.answer(f"⚠️ {html.escape(str(exc))}")
+    except TelegramAPIError:
+        await message.answer("Не вдалося отримати файл. Надішли його ще раз.")
+    else:
+        video_auth.pending.pop(message.chat.id, None)
+        await message.answer(f"✅ Сесію {PLATFORMS[platform]} збережено. Надішли посилання, "
+                             "запусти /grab_pending або докачай відео з історії.")
+    finally:
+        try:
+            await message.delete()
+        except TelegramAPIError:
+            pass
 
 
 @dp.message(Command("pixiv_login"))
@@ -2609,7 +3005,8 @@ async def cancel_pixiv_login(message: types.Message):
 # not a gallery URL. Authentication input never goes into download history.
 @dp.message(F.text, lambda message: message.chat.type == "private"
             and (message.chat.id in pixiv_auth.sessions or message.chat.id in pixiv_auth.exchanging)
-            and not message.text.startswith("/"))
+            and not message.text.startswith("/")
+            and (not re.match(r"https?://", message.text) or is_oauth_response(message.text)))
 async def receive_pixiv_code(message: types.Message):
     try:
         gallery_url = await pixiv_auth.finish(message.chat.id, message.text)
@@ -2655,7 +3052,15 @@ async def cmd_start(message: types.Message):
 
 @dp.message(F.text.regexp(r'^https?://\S+'))
 async def on_link(message: types.Message):
-    asyncio.create_task(handle_url(message, message.text.strip()))
+    urls = list(dict.fromkeys(
+        url for url in re.findall(r'https?://[^\s<>"\']+', message.text)
+        if not is_oauth_response(url)
+    ))
+    # Усі URL з повідомлення зберігаємо до першого await, навіть якщо Telegram відповідає повільно.
+    for url in urls:
+        db.register_download_request(message.chat.id, url)
+    for url in urls:
+        await handle_url(message, url)
 
 
 @dp.message(F.text)
@@ -2667,7 +3072,7 @@ async def handle_partial_selection(message: types.Message):
 
     if message.from_user.id in PENDING_HISTORY_PAGE_REQUESTS:
         mode = PENDING_HISTORY_PAGE_REQUESTS.pop(message.from_user.id)
-        history = db.load_history()
+        history = visible_history(message.chat.id)
         page_count = db.get_history_page_count(len(history))
         try:
             pages = parse_photo_selection(message.text, page_count)
@@ -2688,6 +3093,10 @@ async def handle_partial_selection(message: types.Message):
     if message.from_user.id in PENDING_DELETE_REQUESTS:
         index = PENDING_DELETE_REQUESTS.pop(message.from_user.id)
         if message.text.strip() == "DELETE":
+            history = db.load_history()
+            if index >= len(history) or not can_access_entry(history[index], message.chat.id):
+                await message.answer("Запис не знайдено в цьому чаті.")
+                return
             deleted_entry = db.delete_history_entry(index)
             if not deleted_entry:
                 await message.answer("Запис не знайдено.", reply_markup=build_main_menu())
@@ -2697,7 +3106,7 @@ async def handle_partial_selection(message: types.Message):
                 PENDING_PARTIAL_REQUESTS.pop(message.from_user.id, None)
             await message.answer(
                 f"🗑 Видалено з історії: <b>{deleted_entry.get('gallery_name', 'Без назви')}</b>\n"
-                "Файли архіву на диску не видаляв.",
+                "Збережені файли залишилися на диску.",
                 reply_markup=build_main_menu()
             )
         else:
@@ -2719,7 +3128,7 @@ async def handle_partial_selection(message: types.Message):
     if not existing_zips and not image_messages:
         PENDING_PARTIAL_REQUESTS.pop(message.from_user.id, None)
         if entry:
-            await message.answer("Архів більше не знайдено. Можна скачати наново:", reply_markup=build_redownload_keyboard(entry["url"]))
+            await message.answer("Архів більше не знайдено. Можна скачати наново:", reply_markup=build_redownload_keyboard(entry["url"], message.chat.id))
         else:
             await message.answer("Архів більше не знайдено.", reply_markup=build_main_menu())
         return
@@ -2754,6 +3163,7 @@ async def handle_partial_selection(message: types.Message):
 
 async def main():
     db.init_db()
+    db.recover_video_downloads()
     get_download_queue()
     asyncio.create_task(auto_resume_worker())
     logging.info("🚀 Бот запущено...")

@@ -26,7 +26,11 @@ fi
 echo "Activating venv and updating packages..."
 source venv/bin/activate
 pip install --upgrade pip
-pip install --upgrade aiogram gallery-dl Pillow
+pip install --upgrade -r requirements.txt
+
+if ! command -v ffmpeg >/dev/null || ! command -v ffprobe >/dev/null; then
+    echo "Для відео та анімацій встановіть FFmpeg: sudo apt install ffmpeg"
+fi
 
 # Check gallery-dl version
 echo "gallery-dl version:"

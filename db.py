@@ -7,6 +7,7 @@ db.py — нормалізована SQLite-БД для PixGrabber Bot.
   archive_messages — Telegram-повідомлення з архівами
   image_messages   — Telegram-повідомлення з окремими фото
   preview_messages — Telegram-повідомлення з превʼю
+  download_requests — збережені посилання до натискання кнопки завантаження
 
 Публічний API повністю сумісний зі старим (history як list[dict]),
 тому bot.py потребує мінімальних змін.
@@ -20,6 +21,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
+from uuid import uuid4
 
 log = logging.getLogger(__name__)
 
@@ -57,7 +59,9 @@ CREATE TABLE IF NOT EXISTS downloads (
     archived_at   TEXT    NOT NULL DEFAULT '',
     auto_resume_at TEXT    NOT NULL DEFAULT '',
     auto_resume_chat_id TEXT NOT NULL DEFAULT '',
-    retry_count   INTEGER NOT NULL DEFAULT 0
+    retry_count   INTEGER NOT NULL DEFAULT 0,
+    media_kind    TEXT NOT NULL DEFAULT 'gallery',
+    owner_chat_id TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_downloads_url    ON downloads(url);
@@ -102,12 +106,21 @@ CREATE TABLE IF NOT EXISTS preview_messages (
 
 CREATE INDEX IF NOT EXISTS idx_preview_messages_download ON preview_messages(download_id);
 
+CREATE TABLE IF NOT EXISTS download_requests (
+    token      TEXT PRIMARY KEY,
+    chat_id    TEXT NOT NULL,
+    url        TEXT NOT NULL,
+    pending    INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    UNIQUE(chat_id, url)
+);
+
 CREATE TABLE IF NOT EXISTS schema_version (
     version INTEGER PRIMARY KEY
 );
 """
 
-CURRENT_SCHEMA_VERSION = 4
+CURRENT_SCHEMA_VERSION = 6
 
 
 def init_db():
@@ -131,6 +144,9 @@ def init_db():
 
 def _migrate(conn: sqlite3.Connection, from_version: int):
     """Запускає всі pending-міграції по порядку."""
+    if from_version < 6:
+        _ensure_downloads_column(conn, "media_kind", "TEXT NOT NULL DEFAULT 'gallery'")
+        _ensure_downloads_column(conn, "owner_chat_id", "TEXT NOT NULL DEFAULT ''")
     if from_version < 1:
         _migrate_v0_to_v1(conn)
     if from_version < 2:
@@ -224,8 +240,9 @@ def _insert_legacy_entry(conn: sqlite3.Connection, entry: dict):
     cur = conn.execute(
         """
         INSERT INTO downloads
-            (url, gallery_name, image_count, status, resume_url, download_dir, date, archived_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            (url, gallery_name, image_count, status, resume_url, download_dir, date, archived_at,
+             media_kind, owner_chat_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             entry.get("url", ""),
@@ -236,6 +253,8 @@ def _insert_legacy_entry(conn: sqlite3.Connection, entry: dict):
             entry.get("download_dir", ""),
             entry.get("date", datetime.now().strftime("%Y-%m-%d %H:%M")),
             entry.get("archived_at", ""),
+            entry.get("media_kind", "gallery"),
+            entry.get("owner_chat_id", ""),
         )
     )
     download_id = cur.lastrowid
@@ -327,6 +346,8 @@ def _row_to_entry(conn: sqlite3.Connection, row: sqlite3.Row) -> dict:
 
     return {
         "_id":              did,
+        "media_kind":       row["media_kind"],
+        "owner_chat_id":    row["owner_chat_id"],
         "url":              row["url"],
         "gallery_name":     row["gallery_name"],
         "image_count":      row["image_count"],
@@ -381,6 +402,63 @@ def add_history_entry(url: str, download_dir: str) -> int:
     return total - 1
 
 
+def register_download_request(chat_id: int, url: str, *, pending: bool = True) -> str:
+    """Зберігає посилання до першого звернення до Telegram; повтори мають одну кнопку."""
+    url = url.strip()
+    with get_db() as conn:
+        conn.execute(
+            """INSERT INTO download_requests(token, chat_id, url, pending, created_at)
+               VALUES (?, ?, ?, ?, ?)
+               ON CONFLICT(chat_id, url) DO UPDATE SET pending=MAX(pending, excluded.pending)""",
+            (uuid4().hex, str(chat_id), url, int(pending), datetime.now().isoformat()),
+        )
+        return conn.execute(
+            "SELECT token FROM download_requests WHERE chat_id=? AND url=?", (str(chat_id), url)
+        ).fetchone()["token"]
+
+
+def get_download_request(token: str, chat_id: int) -> Optional[dict]:
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT * FROM download_requests WHERE token=? AND chat_id=?", (token, str(chat_id))
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def list_pending_download_requests(chat_id: int) -> list[dict]:
+    with get_db() as conn:
+        return [dict(row) for row in conn.execute(
+            "SELECT * FROM download_requests WHERE chat_id=? AND pending=1 ORDER BY created_at, rowid",
+            (str(chat_id),),
+        )]
+
+
+def discard_download_request(token: str, chat_id: int):
+    """Прибирає вже оброблене посилання та робить стару кнопку неактивною."""
+    with get_db() as conn:
+        conn.execute(
+            "DELETE FROM download_requests WHERE token=? AND chat_id=?", (token, str(chat_id))
+        )
+
+
+def claim_download_request(token: str, chat_id: int, download_dir: str, *, media_kind: str = "gallery") -> Optional[int]:
+    """Атомарно переносить запит в історію та повертає стабільний ID завантаження."""
+    with get_db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        request = conn.execute(
+            "SELECT url FROM download_requests WHERE token=? AND chat_id=?", (token, str(chat_id))
+        ).fetchone()
+        if request is None:
+            return None
+        cursor = conn.execute(
+            "INSERT INTO downloads(url, download_dir, date, media_kind, owner_chat_id) VALUES (?, ?, ?, ?, ?)",
+            (request["url"], download_dir, datetime.now().strftime("%Y-%m-%d %H:%M"),
+             media_kind, str(chat_id) if media_kind == "video" else ""),
+        )
+        conn.execute("DELETE FROM download_requests WHERE token=? AND chat_id=?", (token, str(chat_id)))
+        return cursor.lastrowid
+
+
 def mark_download_interrupted(download_id: Optional[int]):
     """Не залишаємо аварійно завершену задачу активною; ID не зсувається при видаленні."""
     with get_db() as conn:
@@ -391,6 +469,18 @@ def mark_download_interrupted(download_id: Optional[int]):
                                         THEN 'Завантаження перервано' ELSE gallery_name END
                WHERE id=? AND status='in_progress'""",
             (download_id,)
+        )
+
+
+def recover_video_downloads():
+    """A restarted process has no workers for the old in-progress video jobs."""
+    with get_db() as conn:
+        conn.execute(
+            """UPDATE downloads SET status='interrupted', resume_url=url,
+                      auto_resume_at='', auto_resume_chat_id='',
+                      gallery_name=CASE WHEN gallery_name='in_progress'
+                                        THEN 'Відео — завантаження перервано' ELSE gallery_name END
+               WHERE media_kind='video' AND status='in_progress'"""
         )
 
 
@@ -415,6 +505,8 @@ def update_history_entry(index: int, **kwargs):
             "auto_resume_at": "auto_resume_at",
             "auto_resume_chat_id": "auto_resume_chat_id",
             "retry_count": "retry_count",
+            "media_kind": "media_kind",
+            "owner_chat_id": "owner_chat_id",
         }
         scalar_updates = {
             col: kwargs[key]
@@ -567,9 +659,13 @@ def find_download_id_by_index(index: int) -> Optional[int]:
     return _index_to_id(index)
 
 
+def find_history_index_by_id(download_id: int) -> Optional[int]:
+    return _id_to_index(download_id)
+
+
 def _normalize_gallery_url(url: str) -> str:
     parsed = urlparse((url or "").strip())
-    return parsed._replace(query="", fragment="").geturl().rstrip("/")
+    return parsed._replace(fragment="").geturl().rstrip("/")
 
 
 def find_done_entry_by_url(normalized_url: str) -> Optional[int]:
@@ -618,6 +714,8 @@ def dedup_history() -> tuple[int, int]:
     from collections import defaultdict
     url_groups: dict[str, list[int]] = defaultdict(list)
     for idx, entry in enumerate(history):
+        if entry.get("media_kind") == "video":
+            continue  # Originals are permanent; do not orphan videos or merge different chats.
         url_groups[entry["url"]].append(idx)
 
     indices_to_delete: set[int] = set()

@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from urllib.parse import parse_qs, urlsplit
 
 import aiohttp
+import db
 from aiogram.client.session.base import BaseSession
 from aiogram.types import Chat, Message, Update, User
 
@@ -229,7 +230,7 @@ class RecordingSession(BaseSession):
 
     async def make_request(self, bot, method, timeout=None):
         self.calls.append(method)
-        if method.__api_method__ == "deleteMessage":
+        if method.__api_method__ in ("deleteMessage", "answerCallbackQuery"):
             return True
         return Message(message_id=900, date=datetime.now(timezone.utc),
                        chat=Chat(id=int(method.chat_id), type="private"),
@@ -257,6 +258,12 @@ class BotFlowTests(unittest.IsolatedAsyncioTestCase):
         finally:
             os.chdir(previous)
         self.module.pixiv_auth = auth.PixivAuth(scratch / "auth")
+        for name, value in (("HISTORY_DB_FILE", scratch / "history.sqlite3"),
+                            ("HISTORY_FILE", scratch / "history.json")):
+            db_path = patch.object(db, name, value)
+            db_path.start()
+            self.addCleanup(db_path.stop)
+        db.init_db()
         self.session = RecordingSession()
         self.module.bot.session = self.session
         for name, value in (("load_history", []), ("find_done_entry_by_url", None)):

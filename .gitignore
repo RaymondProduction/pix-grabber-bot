@@ -3,3 +3,5 @@ config.json
 venv
 history.json
 .pixiv-auth/
+.video-auth/
+videos/

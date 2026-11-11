@@ -157,7 +157,7 @@ class ArchiveTests(unittest.IsolatedAsyncioTestCase):
         second = db.add_history_entry("https://example.com/second", str(self.folder))
         queue = self.module.get_download_queue()
         for index in (self.index, second):
-            await queue.put((self.message, "https://example.com/gallery", index, self.folder))
+            await queue.put((self.message, "https://example.com/gallery", db.find_download_id_by_index(index), self.folder))
         self.message.answer.side_effect = RuntimeError("Telegram unavailable")
         with patch.object(self.module, "run_download", AsyncMock(side_effect=[RuntimeError("download failed"), None])) as run:
             worker = asyncio.create_task(self.module.queue_worker())
