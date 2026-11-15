@@ -49,6 +49,7 @@ bot = Bot(token=CONFIG["telegram_token"], default=DefaultBotProperties(parse_mod
 dp = Dispatcher()
 pixiv_auth = PixivAuth()
 video_auth = VideoAuth()
+VIDEO_PLATFORMS = {**PLATFORMS, "xvideos": "XVideos"}
 
 BASE_DOWNLOAD_DIR = Path("images")
 BASE_DOWNLOAD_DIR.mkdir(exist_ok=True)
@@ -467,7 +468,7 @@ def build_video_history_keyboard(index: int, entry: dict) -> InlineKeyboardMarku
     if entry.get("status") == "interrupted":
         buttons.append([InlineKeyboardButton(text="⏩ Докачати", callback_data=f"resume:{index}")])
         platform = video_platform(entry.get("url", ""))
-        if platform and int(entry.get("owner_chat_id") or 0) > 0:
+        if platform in PLATFORMS and int(entry.get("owner_chat_id") or 0) > 0:
             buttons.append([video_login_button(int(entry["owner_chat_id"]), platform)])
             buttons.append([video_retry_button(platform)])
     buttons.extend([
@@ -529,6 +530,8 @@ def enqueue_failed_videos(chat_id: int, platform: str) -> int:
 
 
 async def suggest_video_login(message, platform: str, *, required: bool):
+    if platform not in PLATFORMS:
+        return
     if message.chat.id <= 0:
         await message.answer(
             f"🔐 Підключення {PLATFORMS[platform]} доступне в особистому чаті: /{platform}_login.\n"
@@ -709,13 +712,13 @@ async def run_video_download(message, url: str, history_index: int, download_dir
     download_id = db.find_download_id_by_index(history_index)
     db.update_history_entry(history_index, media_kind="video", owner_chat_id=str(message.chat.id),
                             resume_url=url, download_dir=str(download_dir),
-                            gallery_name=f"{PLATFORMS[platform]} — відео")
+                            gallery_name=f"{VIDEO_PLATFORMS[platform]} — відео")
     error = None
     try:
         ensure_video_storage(BASE_DOWNLOAD_DIR, VIDEO_DOWNLOAD_DIR)
         if not shutil.which("ffmpeg"):
             raise VideoDownloadError("На сервері потрібен FFmpeg: sudo apt install ffmpeg.")
-        cookies = video_auth.read(message.chat.id, platform)
+        cookies = video_auth.read(message.chat.id, platform) if platform in PLATFORMS else None
         await download_video(
             url, download_dir, cookies,
             timeout=int(CONFIG.get("video_timeout_sec", 1800)),
@@ -723,10 +726,13 @@ async def run_video_download(message, url: str, history_index: int, download_dir
             max_bytes=int(CONFIG.get("max_video_download_size_mb", 2048)) * 1024 ** 2,
             on_authors=lambda authors: persist_authors(download_id, url, authors, "yt-dlp"),
         )
-        if video_auth.read(message.chat.id, platform) != cookies:
+        if platform in PLATFORMS and video_auth.read(message.chat.id, platform) != cookies:
             raise VideoAuthError("Сесію змінено під час завантаження. Повтори дію з історії.")
     except (VideoDownloadError, VideoAuthError) as exc:
         error = exc
+        if platform not in PLATFORMS and getattr(exc, "needs_login", False):
+            error = VideoDownloadError(
+                "Сайт вимагає авторизації для цього відео. Бот поки підтримує XVideos лише без входу.")
     except asyncio.CancelledError:
         db.mark_download_interrupted(download_id)
         raise
@@ -743,7 +749,7 @@ async def run_video_download(message, url: str, history_index: int, download_dir
     items = saved_videos(download_dir)
     if not error:
         db.mark_author_check(download_id)
-    title = items[0]["title"] if items else f"{PLATFORMS[platform]} — відео"
+    title = items[0]["title"] if items else f"{VIDEO_PLATFORMS[platform]} — відео"
     db.update_history_entry(history_index, status="interrupted" if error else "done",
                             gallery_name=title, image_count=len(items),
                             resume_url=url if error else "", auto_resume_at="", auto_resume_chat_id="")
@@ -1852,7 +1858,7 @@ async def run_download(message: types.Message, url: str, history_index: int, dow
     if platform:
         entry = db.load_history()[history_index]
         if entry.get("media_kind") != "video":
-            # Older versions sent YouTube to gallery-dl and used the images directory.
+            # Older versions sent unsupported videos to gallery-dl's images directory.
             download_dir = VIDEO_DOWNLOAD_DIR / platform / str(message.chat.id) / f"retry_{entry['_id']}"
         return await run_video_download(message, url, history_index, download_dir)
     return await run_gallery_download(message, url, history_index, download_dir)
@@ -3454,23 +3460,25 @@ async def handle_partial_selection(message: types.Message):
         PENDING_PARTIAL_REQUESTS.pop(message.from_user.id, None)
 
 
-def recover_legacy_youtube_downloads():
+def recover_legacy_video_downloads():
     """Recover empty gallery failures only when their original chat is known."""
     for entry in db.load_history():
+        platform = video_platform(entry["url"])
         if (entry.get("media_kind") == "video" or entry.get("status") not in ("interrupted", "failed")
-                or entry.get("image_count") or video_platform(entry["url"]) != "youtube"):
+                or entry.get("image_count") or platform not in ("youtube", "xvideos")):
             continue
         chat_id = entry.get("owner_chat_id") or entry.get("auto_resume_chat_id") or ""
         if not chat_id.lstrip("-").isdigit() or int(chat_id) == 0:
             continue
-        folder = VIDEO_DOWNLOAD_DIR / "youtube" / chat_id / f"retry_{entry['_id']}"
-        db.promote_empty_video_download(entry["_id"], chat_id, str(folder))
+        folder = VIDEO_DOWNLOAD_DIR / platform / chat_id / f"retry_{entry['_id']}"
+        db.promote_empty_video_download(entry["_id"], chat_id, str(folder),
+                                        gallery_name=f"{VIDEO_PLATFORMS[platform]} — відео")
 
 
 async def main():
     db.init_db()
     db.recover_video_downloads()
-    recover_legacy_youtube_downloads()
+    recover_legacy_video_downloads()
     get_download_queue()
     asyncio.create_task(auto_resume_worker())
     logging.info("🚀 Бот запущено...")

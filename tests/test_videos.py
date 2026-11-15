@@ -31,7 +31,8 @@ from test_pixiv_auth import RecordingSession
 ROOT = Path(__file__).resolve().parents[1]
 URLS = ["https://www.facebook.com/reel/123", "https://www.instagram.com/reel/abc/",
         "https://www.tiktok.com/@test/video/123",
-        "https://youtube.com/shorts/pHofASeGcds?si=We57kcQUClqtbdMX"]
+        "https://youtube.com/shorts/pHofASeGcds?si=We57kcQUClqtbdMX",
+        "https://www.videoxx.com/video.abc123/example"]
 
 
 def cookies(platform="facebook", expiry="0"):
@@ -124,7 +125,7 @@ class ErrorClassificationTests(unittest.TestCase):
 
 class RoutingStorageTests(unittest.TestCase):
     def test_platforms_short_links_and_spoofed_domains(self):
-        for url, expected in zip(URLS, ("facebook", "instagram", "tiktok", "youtube")):
+        for url, expected in zip(URLS, ("facebook", "instagram", "tiktok", "youtube", "xvideos")):
             self.assertEqual(video.video_platform(url), expected)
         for url in ("https://fb.watch/abc", "https://m.facebook.com/watch/?v=123",
                     "https://www.facebook.com/share/r/abc"):
@@ -150,6 +151,37 @@ class RoutingStorageTests(unittest.TestCase):
                     "https://youtube.com/redirect?q=https://example.test", "https://youtu.be/",
                     "https://youtube.com/watch?v=invalid", "https://youtu.be:8080/pHofASeGcds"):
             self.assertIsNone(video.video_platform(url))
+
+    def test_xvideos_mirrors_use_specific_extractor_and_preserve_source_url(self):
+        from yt_dlp.extractor.xvideos import XVideosIE
+        from author_metadata import source_platform
+        for url in (URLS[4], "https://videoxx.com/video123/example?share=1#fragment",
+                    "https://www.xvideos.com/video.abc123/example",
+                    "https://www.xvideos2.com/video123/example",
+                    "https://www.xvideos.es/video123/example",
+                    "https://www.xvideos.com/embedframe/123"):
+            with self.subTest(url=url):
+                self.assertEqual(video.video_platform(url), "xvideos")
+                self.assertEqual(source_platform(url), "xvideos")
+                args = video.download_command(url, Path("output"), None, 1024)
+                self.assertTrue(XVideosIE.suitable(args[-1]))
+                self.assertNotIn("--cookies", args)
+                self.assertNotIn("--js-runtimes", args)
+        self.assertEqual(video.normalize_video_url(URLS[4]), "https://www.xvideos.com/video.abc123/example")
+        self.assertEqual(video.normalize_video_url("https://videoxx.com/video123/example?share=1#fragment"),
+                         "https://www.xvideos.com/video123/example?share=1#fragment")
+
+    def test_xvideos_profiles_and_spoofed_hosts_are_not_routed_as_videos(self):
+        for url in ("https://www.videoxx.com/", "https://www.xvideos.com/profiles/example",
+                    "https://www.xvideos.com/?k=example", "https://www.xvideos.com/video",
+                    "https://videoxx.com.evil.test/video123/example",
+                    "https://notvideoxx.com/video123/example",
+                    "https://videoxx.com@evil.test/video123/example",
+                    "https://user:password@videoxx.com/video123/example",
+                    "https://videoxx.com:8080/video123/example"):
+            with self.subTest(url=url):
+                self.assertIsNone(video.video_platform(url))
+                self.assertEqual(video.normalize_video_url(url), url)
 
     def test_youtube_uses_explicit_deno_and_reports_missing_runtime_without_login_prompt(self):
         from yt_dlp import parse_options
@@ -632,6 +664,24 @@ class VideoBotTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(any("/facebook_login" in call.args[0] for call in self.message.answer.await_args_list))
         self.assertEqual(self.module.video_auth.pending, {})
 
+    async def test_xvideos_failure_keeps_retry_without_unsupported_cookie_buttons(self):
+        for case, failure in enumerate(("Unable to extract video data", "Login required")):
+            self.message.answer.reset_mock()
+            url = f"{URLS[4]}?case={case}"
+            index, folder = await self.download(url, failure=video.classify_download_error(failure))
+            entry = db.load_history()[index]
+            self.assertEqual((entry["status"], entry["url"], entry["gallery_name"]),
+                             ("interrupted", url, "XVideos — відео"))
+            self.assertEqual(self.module.video_auth.pending, {})
+            texts = [call.args[0] for call in self.message.answer.await_args_list]
+            self.assertFalse(any("_login" in text or "cookies" in text for text in texts))
+            keyboard = self.module.build_video_history_keyboard(index, entry)
+            callbacks = [button.callback_data for row in keyboard.inline_keyboard for button in row]
+            self.assertIn(f"resume:{index}", callbacks)
+            self.assertFalse(any(value.startswith(("video_login:", "video_retry:")) for value in callbacks))
+            self.assertTrue(self.module.enqueue_video_retry(123, entry))
+            self.assertEqual(self.module.get_download_queue().get_nowait()[2], entry["_id"])
+
     async def test_group_auth_suggestion_directs_user_to_private_chat(self):
         self.message.chat = SimpleNamespace(id=-100, type="group")
         await self.module.suggest_video_login(self.message, "facebook", required=False)
@@ -868,8 +918,8 @@ class VideoBotTests(unittest.IsolatedAsyncioTestCase):
         download_id = db.find_download_id_by_index(index)
         db.update_history_entry(index, status="interrupted", resume_url=URLS[3],
                                 auto_resume_chat_id="123", auto_resume_at="2099-01-01 00:00:00")
-        self.module.recover_legacy_youtube_downloads()
-        self.module.recover_legacy_youtube_downloads()
+        self.module.recover_legacy_video_downloads()
+        self.module.recover_legacy_video_downloads()
         entry = db.load_history()[index]
         self.assertEqual((entry["_id"], entry["media_kind"], entry["owner_chat_id"], entry["status"]),
                          (download_id, "video", "123", "interrupted"))
@@ -887,8 +937,32 @@ class VideoBotTests(unittest.IsolatedAsyncioTestCase):
             db.update_history_entry(index, **(values | updates))
         gallery = db.add_history_entry(URLS[1], "images/instagram-photos")
         db.update_history_entry(gallery, status="interrupted", auto_resume_chat_id="123")
-        self.module.recover_legacy_youtube_downloads()
+        self.module.recover_legacy_video_downloads()
         self.assertTrue(all(entry["media_kind"] == "gallery" for entry in db.load_history()))
+
+    async def test_legacy_xvideos_recovery_preserves_owner_source_and_manual_retry(self):
+        index = db.add_history_entry(URLS[4], "images/old-xvideos")
+        download_id = db.find_download_id_by_index(index)
+        db.update_history_entry(index, status="interrupted", resume_url=URLS[4],
+                                auto_resume_chat_id="123", auto_resume_at="2099-01-01 00:00:00")
+        self.module.recover_legacy_video_downloads()
+        self.module.recover_legacy_video_downloads()
+        entry = db.load_history()[index]
+        self.assertEqual((entry["_id"], entry["media_kind"], entry["owner_chat_id"], entry["status"]),
+                         (download_id, "video", "123", "interrupted"))
+        self.assertEqual((entry["url"], entry["resume_url"], entry["gallery_name"]),
+                         (URLS[4], URLS[4], "XVideos — відео"))
+        self.assertEqual(entry["auto_resume_at"], "")
+        self.assertFalse(self.module.can_access_entry(entry, 456))
+        callback = SimpleNamespace(data=f"resume:{index}", message=self.message, answer=AsyncMock())
+        await self.module.resume_download(callback)
+        message, url, queued_id, folder = self.module.get_download_queue().get_nowait()
+        self.assertEqual(queued_id, download_id)
+        self.assertIn(self.ssd.resolve(), folder.resolve().parents)
+        with patch.object(self.module, "download_video", AsyncMock(side_effect=self.completed_download)), \
+                patch.object(self.module.shutil, "which", return_value="/usr/bin/ffmpeg"):
+            await self.module.run_download(self.message, url, index, folder)
+        self.assertEqual(db.load_history()[index]["status"], "done")
 
     async def test_legacy_manual_resume_routes_youtube_to_video_storage(self):
         old_folder = self.root / "old-images-on-sd"

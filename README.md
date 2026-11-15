@@ -4,7 +4,7 @@ Telegram bot for downloading galleries using **gallery-dl** and social videos us
 
 ## Features
 - Download images from web sites
-- Download Facebook, Instagram and TikTok videos with sound, with optional per-chat browser sessions
+- Download Facebook, Instagram, TikTok, YouTube and XVideos videos with sound
 - Keep original videos separately on the same storage as images, without ZIP archives
 - Convert Pixiv Ugoira animations to MP4 and send them as Telegram animations
 - Two modes: real-time (one by one) and fast (all at once)
@@ -112,6 +112,17 @@ Use **/history** to see previous downloads and re-send archives
 переводяться у відео після перезапуску, якщо в історії збережено початковий чат.
 Їх можна докачати кнопкою в історії; нова папка створюється у сховищі відео на SSD.
 Канали та окремі плейлисти YouTube цей режим не завантажує.
+
+### Відео XVideos
+
+Прямі посилання на відео `xvideos.com`, `xvideos2.com`, `xvideos.es` та `videoxx.com`
+завантажуються через `yt-dlp`. Для `videoxx.com` бот використовує відповідну адресу
+`xvideos.com`, зберігаючи початкове посилання в історії. Підтримуються публічні відео
+без входу; імпорт cookies XVideos поки недоступний. Збереження на SSD та надсилання
+великих файлів частинами працюють так само, як для інших відео.
+
+Після перезапуску старі порожні невдалі спроби XVideos переводяться з галерей у відео,
+якщо відомий початковий чат. Повторити завантаження можна кнопкою **Докачати** в історії.
 
 При неоднозначній відповіді сайту (наприклад, Facebook `Cannot parse data`) бот також
 пропонує кнопку підключення акаунта або оновлення cookies. Це варіант повторної спроби,

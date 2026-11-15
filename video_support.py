@@ -68,6 +68,13 @@ def video_platform(url: str) -> str | None:
         if (parsed.scheme not in ("https", "http") or parsed.username or parsed.password
                 or parsed.port not in (None, 80, 443) or any(ord(c) < 33 for c in url)):
             return None
+        if any(host == root or host.endswith("." + root)
+               for root in ("xvideos.com", "xvideos2.com", "xvideos.es", "videoxx.com")):
+            if re.match(r"/video\.?[a-z0-9]+(?:/|$)", parsed.path):
+                return "xvideos"
+            if host in ("www.xvideos.com", "flashservice.xvideos.com", "www.videoxx.com"):
+                if re.fullmatch(r"/embedframe/[a-z0-9]+/?", parsed.path):
+                    return "xvideos"
         if host in ("youtu.be", "www.youtu.be"):
             if re.fullmatch(r"/[\w-]{11}/?", parsed.path, re.ASCII):
                 return "youtube"
@@ -96,6 +103,16 @@ def video_platform(url: str) -> str | None:
     except ValueError:
         pass
     return None
+
+
+def normalize_video_url(url: str) -> str:
+    """Use the XVideos extractor for its videoxx mirror instead of generic HTML."""
+    if video_platform(url) == "xvideos":
+        parsed = urlsplit(url)
+        host = (parsed.hostname or "").lower()
+        if host == "videoxx.com" or host.endswith(".videoxx.com"):
+            return parsed._replace(netloc="www.xvideos.com").geturl()
+    return url
 
 
 def video_root(images: Path, configured: str = "") -> Path:
@@ -153,7 +170,7 @@ def download_command(url: str, folder: Path, cookies: Path | None, max_bytes: in
         args += ["--js-runtimes", f"deno:{deno}"]
     if cookies:
         args += ["--cookies", str(cookies)]
-    return args + ["--", url]
+    return args + ["--", normalize_video_url(url)]
 
 
 async def download_video(url: str, folder: Path, cookies: bytes | None, *,

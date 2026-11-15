@@ -47,6 +47,8 @@ def source_platform(url: str) -> str:
                            ("youtu.be", "youtube"), ("youtube-nocookie.com", "youtube"),
                            ("facebook.com", "facebook"), ("fb.watch", "facebook"),
                            ("instagram.com", "instagram"), ("tiktok.com", "tiktok"),
+                           ("xvideos.com", "xvideos"), ("xvideos2.com", "xvideos"),
+                           ("xvideos.es", "xvideos"), ("videoxx.com", "xvideos"),
                            ("rule34.xxx", "rule34")):
         if host == root or host.endswith("." + root):
             return platform
