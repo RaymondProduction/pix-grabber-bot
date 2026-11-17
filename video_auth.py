@@ -1,5 +1,6 @@
 """Per-chat browser sessions, using the Netscape import used by ai-chat."""
 
+import io
 import os
 import re
 import tempfile
@@ -20,11 +21,27 @@ class VideoAuthError(ValueError):
     pass
 
 
+def check_cookie_size(size: int):
+    if size > COOKIE_LIMIT:
+        raise VideoAuthError(
+            f"Файл cookies завеликий ({size / 1024:.1f} КіБ). Ліміт — 256 КіБ. "
+            "Експортуй cookies лише потрібного сайту, а не всього браузера.")
+
+
+class CookieUploadBuffer(io.BytesIO):
+    """Bound actual download bytes even when Telegram omits the document size."""
+
+    def write(self, data):
+        check_cookie_size(self.tell() + len(data))
+        return super().write(data)
+
+
 def normalize_cookies(raw: bytes, platform: str) -> bytes:
     if platform not in PLATFORMS:
         raise VideoAuthError("Невідомий сервіс.")
-    if len(raw) > COOKIE_LIMIT:
-        raise VideoAuthError("Файл cookies має бути не більшим за 256 КіБ.")
+    check_cookie_size(len(raw))
+    if not raw:
+        raise VideoAuthError("Файл cookies порожній. Експортуй cookies потрібного сайту ще раз.")
     try:
         lines = raw.decode("utf-8-sig").splitlines()
     except UnicodeError:

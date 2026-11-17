@@ -33,7 +33,7 @@ import db
 from pixiv_auth import PixivAuth, PixivAuthError, is_oauth_response, is_pixiv_url
 from media_support import ANIMATION_EXTENSIONS, PIXIV_POSTPROCESSORS, DownloadActivity, probe_animation
 from author_metadata import GALLERY_AUTHOR_POSTPROCESSOR, clean, parse_gallery_authors, source_platform, write_author_sidecar
-from video_auth import VideoAuth, VideoAuthError, PLATFORMS, COOKIE_LIMIT
+from video_auth import VideoAuth, VideoAuthError, PLATFORMS, CookieUploadBuffer, check_cookie_size
 from video_delivery import VideoDeliveryError, prepare_video_parts, create_video_preview
 from video_support import (
     VideoDownloadError, video_platform, video_root, ensure_video_storage,
@@ -3243,11 +3243,15 @@ async def cancel_video_login(message: types.Message):
 async def receive_video_cookies(message: types.Message):
     platform = video_auth.pending[message.chat.id]
     try:
-        if not message.document.file_size or message.document.file_size > COOKIE_LIMIT:
-            raise VideoAuthError("Файл cookies має бути не більшим за 256 КіБ.")
-        buffer = io.BytesIO()
-        await bot.download(message.document, destination=buffer)
-        video_auth.save(message.chat.id, platform, buffer.getvalue())
+        declared_size = message.document.file_size
+        logging.info("Video cookie upload for %s: declared_bytes=%s", platform, declared_size)
+        if declared_size is not None:
+            check_cookie_size(declared_size)
+        with CookieUploadBuffer() as buffer:
+            await bot.download(message.document, destination=buffer)
+            raw = buffer.getvalue()
+            logging.info("Video cookie upload for %s: downloaded_bytes=%s", platform, len(raw))
+            video_auth.save(message.chat.id, platform, raw)
     except VideoAuthError as exc:
         await message.answer(f"⚠️ {html.escape(str(exc))}")
     except TelegramAPIError:

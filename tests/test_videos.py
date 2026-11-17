@@ -88,6 +88,13 @@ class CookieTests(unittest.TestCase):
         jar.load()
         self.assertEqual({c.name for c in jar}, {"c_user", "xs"})
 
+    def test_cookie_upload_buffer_rejects_overflow_before_retaining_extra_bytes(self):
+        with auth.CookieUploadBuffer() as buffer:
+            buffer.write(b"x" * auth.COOKIE_LIMIT)
+            with self.assertRaisesRegex(auth.VideoAuthError, "Ліміт"):
+                buffer.write(b"extra")
+            self.assertEqual(len(buffer.getvalue()), auth.COOKIE_LIMIT)
+
     def test_youtube_accepts_secure_session_and_filters_google_cookies(self):
         raw = cookies("youtube").replace(b"SAPISID", b"__Secure-3PAPISID")
         raw += b".google.com\tTRUE\t/\tTRUE\t0\tSAPISID\tprivate-google-cookie\n"
@@ -787,6 +794,66 @@ class VideoBotTests(unittest.IsolatedAsyncioTestCase):
         await feed("/tiktok_login")
         await feed("/cancel")
         self.assertNotIn(123, self.module.video_auth.pending)
+
+    async def test_cookie_import_accepts_missing_zero_and_known_document_sizes(self):
+        raw = cookies("instagram")
+
+        async def download_file(document, destination):
+            destination.write(raw[:20])
+            destination.write(raw[20:])
+            destination.seek(0)
+
+        for size in (None, 0, len(raw)):
+            with self.subTest(size=size):
+                self.message.answer.reset_mock()
+                self.module.video_auth.pending[123] = "instagram"
+                self.message.document = Document(file_id="test", file_unique_id="unique", file_size=size)
+                with patch.object(self.module.bot, "download", AsyncMock(side_effect=download_file)) as download:
+                    await self.module.receive_video_cookies(self.message)
+                download.assert_awaited_once()
+                self.assertEqual(self.module.video_auth.read(123, "instagram"), raw)
+                self.assertNotIn(123, self.module.video_auth.pending)
+                self.assertIn("Сесію Instagram збережено", self.message.answer.await_args.args[0])
+
+    async def test_oversized_cookie_document_is_rejected_before_downloading(self):
+        self.module.video_auth.pending[123] = "instagram"
+        self.module.video_auth.save(123, "instagram", cookies("instagram"))
+        self.message.document = SimpleNamespace(file_size=803 * 1024)
+        with patch.object(self.module.bot, "download", AsyncMock()) as download:
+            await self.module.receive_video_cookies(self.message)
+        download.assert_not_awaited()
+        self.assertEqual(self.module.video_auth.read(123, "instagram"), cookies("instagram"))
+        self.assertEqual(self.module.video_auth.pending[123], "instagram")
+        self.assertIn("803.0 КіБ", self.message.answer.await_args.args[0])
+        self.assertIn("лише потрібного сайту", self.message.answer.await_args.args[0])
+        self.message.delete.assert_awaited_once()
+
+    async def test_actual_cookie_size_limit_applies_to_unknown_or_underreported_size(self):
+        async def download_file(document, destination):
+            destination.write(b"x" * auth.COOKIE_LIMIT)
+            destination.write(b"overflow")
+
+        self.module.video_auth.save(123, "instagram", cookies("instagram"))
+        for size in (None, 1):
+            with self.subTest(size=size):
+                self.message.answer.reset_mock()
+                self.module.video_auth.pending[123] = "instagram"
+                self.message.document = SimpleNamespace(file_size=size)
+                with patch.object(self.module.bot, "download", AsyncMock(side_effect=download_file)):
+                    await self.module.receive_video_cookies(self.message)
+                self.assertEqual(self.module.video_auth.read(123, "instagram"), cookies("instagram"))
+                self.assertEqual(self.module.video_auth.pending[123], "instagram")
+                self.assertIn("Ліміт — 256 КіБ", self.message.answer.await_args.args[0])
+
+    async def test_empty_cookie_document_is_not_reported_as_oversized(self):
+        self.module.video_auth.pending[123] = "instagram"
+        self.message.document = SimpleNamespace(file_size=None)
+        with patch.object(self.module.bot, "download", AsyncMock()):
+            await self.module.receive_video_cookies(self.message)
+        self.assertIn("порожній", self.message.answer.await_args.args[0])
+        self.assertNotIn("КіБ", self.message.answer.await_args.args[0])
+        self.assertEqual(self.module.video_auth.pending[123], "instagram")
+        self.assertIsNone(self.module.video_auth.read(123, "instagram"))
 
     async def test_batch_retry_is_scoped_to_chat_and_site_and_preserves_history(self):
         first, first_folder = self.video_entry()
